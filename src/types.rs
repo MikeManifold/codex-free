@@ -511,6 +511,9 @@ impl McpServerProvenance {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerSpec {
+    /// Native adapter for the official Codex App Server. No Node MCP process.
+    #[serde(default)]
+    pub app_server: Option<crate::app_server::AppServerConfig>,
     /// The executable to launch (e.g. `idasql`, `npx`, `python`). Absent for
     /// Streamable HTTP servers.
     #[serde(default)]

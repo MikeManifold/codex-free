@@ -4,6 +4,7 @@
 //! chosen work directory. See the module docs for the piece-by-piece port of the
 //! original TypeScript.
 
+pub mod app_server;
 pub mod apply_patch;
 pub mod artifact_egress;
 pub mod artifact_ingress;

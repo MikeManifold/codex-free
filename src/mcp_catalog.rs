@@ -6,15 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rmcp::RoleClient;
 use rmcp::model::{
     CallToolRequestParams, Implementation, MetaObject, ServerPeerInfo, Tool as McpTool,
     ToolAnnotations,
 };
-use rmcp::service::Peer;
 use serde_json::{Map, Value, json};
 
-use crate::bridge::{attach_call_owner, forward_tool_call};
+use crate::bridge::{UpstreamPeer, attach_call_owner, forward_tool_call};
 use crate::exec_sessions::SessionState;
 use crate::local_ui;
 use crate::tool::{Tool, ToolCallIdentity, ToolRequestContext};
@@ -66,7 +64,7 @@ pub(crate) struct CatalogSourceInput {
     pub transport: String,
     pub peer_info: Option<Arc<ServerPeerInfo>>,
     pub tools: Vec<McpTool>,
-    pub peer: Peer<RoleClient>,
+    pub peer: UpstreamPeer,
     pub tool_timeout: Option<Duration>,
 }
 
@@ -84,7 +82,7 @@ struct CatalogSource {
     instructions: Option<String>,
     tools: Vec<CatalogTool>,
     tool_by_id: HashMap<String, usize>,
-    peer: Peer<RoleClient>,
+    peer: UpstreamPeer,
     tool_timeout: Option<Duration>,
 }
 

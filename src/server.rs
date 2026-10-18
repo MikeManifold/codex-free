@@ -619,6 +619,7 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
     let bridge = crate::bridge::connect_upstreams(&config).await;
     let bridge_report = bridge.report;
     let _bridge_services = bridge.services;
+    let _app_server_services = bridge.app_servers;
 
     let mut all_tools = load_tools_for_config(&config);
     let native: std::collections::HashSet<&'static str> =

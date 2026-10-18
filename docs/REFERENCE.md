@@ -1130,6 +1130,31 @@ Upstream MCP servers:
 
 An upstream that fails to launch, connect, authenticate, or answer is skipped; it never blocks startup or the native tools. Every configured server is reported, so a bad path or failed handshake is not silent.
 
+### Native official App Server
+
+The optional `"type": "codex-app-server"` source uses Free's Rust adapter directly. It starts an owned `codex app-server --listen stdio://` child on first use, without a persistent Node adapter or a model turn:
+
+```json
+{
+  "mcpServers": {
+    "codex_app_server": {
+      "type": "codex-app-server",
+      "mode": "catalog",
+      "toolTimeoutSec": 600,
+      "appServer": {
+        "configFile": "/absolute/path/to/bridge.config.local.json"
+      }
+    }
+  }
+}
+```
+
+`appServer` accepts `configFile` or inline host settings: `version` (1), `codexCli`, `workDir`, `codexHome`, `requestTimeoutMs` (120000), `confirmationTimeoutMs` (300000), and `allowRawRpc` (false). Timeouts must be 1000–600000 ms. The referenced file must have `version: 1`; relative host paths resolve against that file. `cwd` sets the process directory independently of the utility `workDir`. Explicit native transport replaces inherited command/HTTP settings, but explicitly combining the two is rejected. Tool allow/deny lists and exposure modes still apply.
+
+The 26 adapter tools retain their compatibility names. `codex_mcp_status` discovers live upstream names; with `serverName` and `toolName` it returns the tool's current metadata and schema. `codex_mcp_call` forwards the discovered name and arguments. New upstream tools need no hardcoded registration; incompatible App Server RPC changes still require maintenance.
+
+Native MCP media and confirmation operations are preserved. An exited child is recreated on the next new call; failed operations are never replayed automatically. Native Rust execution and file tools remain independent for recovery. See the [integration guide](../integrations/codex-app-server-bridge/README.md) for configuration, confirmation and test details.
+
 ### Catalog mode (default for automatic imports)
 
 Catalog mode is the closest architecture an MCP-only bridge can provide to Codex's deferred tool exposure. Codex Free still discovers and stores every filtered upstream definition internally, but downstream `tools/list` receives only a small fixed surface:
@@ -1262,7 +1287,7 @@ The native OpenAI tunnel removes the general public-URL exposure, but it does no
 
 ## Local macOS updates
 
-The optional [App Server bridge](../integrations/codex-app-server-bridge/README.md) keeps host paths in an ignored personal configuration; its checked-in example contains generic defaults. It forwards human confirmations as resumable operations and preserves MCP images.
+The optional [native App Server adapter](../integrations/codex-app-server-bridge/README.md) keeps host paths in an ignored personal configuration; its checked-in example contains generic defaults. It forwards human confirmations as resumable operations and preserves MCP images.
 
 For an existing locally signed LaunchAgent installation, copy `scripts/install.config.example.json` to `~/.codex-free/install.local.json` and enter the existing service paths, stable signing identifier and public identity metadata file. Each app needs its own identifier; multiple apps may use the same local certificate. Keep the private key in the login keychain and allow only the signing tool to use it. These installers do not generate keys, change trust or request authentication repeatedly.
 

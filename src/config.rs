@@ -366,6 +366,7 @@ struct PartialProjectCatalog {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PartialMcpServerSpec {
+    app_server: Option<crate::app_server::AppServerConfig>,
     command: Option<String>,
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
@@ -389,6 +390,7 @@ struct PartialMcpServerSpec {
 impl PartialMcpServerSpec {
     fn overlay(self, mut base: McpServerSpec) -> McpServerSpec {
         let Self {
+            app_server,
             command,
             args,
             env,
@@ -407,6 +409,9 @@ impl PartialMcpServerSpec {
             disabled_tools,
             mode,
         } = self;
+        if let Some(settings) = app_server {
+            base.app_server = Some(settings);
+        }
         let sets_command = command.is_some();
         let sets_args = args.is_some();
         let sets_env = env.is_some();
@@ -416,6 +421,7 @@ impl PartialMcpServerSpec {
         let sets_bearer_token_env_var = bearer_token_env_var.is_some();
         let sets_http_headers = http_headers.is_some();
         let sets_env_http_headers = env_http_headers.is_some();
+        let sets_shared_oauth = shared_codex_oauth.is_some();
 
         if let Some(command) = command {
             base.command = Some(command);
@@ -467,6 +473,30 @@ impl PartialMcpServerSpec {
         }
         if let Some(mode) = mode {
             base.mode = Some(mode);
+        }
+
+        if base.transport.as_deref() == Some("codex-app-server") {
+            if !sets_command {
+                base.command = None;
+            }
+            if !sets_args {
+                base.args.clear();
+            }
+            if !sets_url {
+                base.url = None;
+            }
+            if !sets_bearer_token_env_var {
+                base.bearer_token_env_var = None;
+            }
+            if !sets_http_headers {
+                base.http_headers.clear();
+            }
+            if !sets_env_http_headers {
+                base.env_http_headers.clear();
+            }
+            if !sets_shared_oauth {
+                base.shared_codex_oauth = false;
+            }
         }
 
         // Naming a different transport replaces the imported transport rather
@@ -1511,6 +1541,7 @@ mod tests {
 
     fn imported_server() -> McpServerSpec {
         McpServerSpec {
+            app_server: None,
             command: Some("codex-server".to_string()),
             args: vec!["--stdio".to_string()],
             env: HashMap::from([("TOKEN".to_string(), "secret".to_string())]),
@@ -2216,6 +2247,30 @@ mod tests {
             Some(&["write".to_string()][..])
         );
         assert!(demo.command.is_none());
+    }
+
+    #[test]
+    fn native_app_server_overlay_replaces_imported_transport_but_rejects_explicit_conflicts() {
+        let old = McpServerSpec {
+            command: Some("node".into()),
+            args: vec!["server.mjs".into()],
+            ..Default::default()
+        };
+        let partial:PartialMcpServerSpec=serde_json::from_value(serde_json::json!({
+            "type":"codex-app-server","mode":"catalog","appServer":{"codexCli":"/opt/codex","workDir":"/workspace"}
+        })).unwrap();
+        let merged = partial.overlay(old.clone());
+        assert!(merged.command.is_none());
+        assert!(merged.args.is_empty());
+        assert_eq!(
+            merged.app_server.unwrap().work_dir.as_deref(),
+            Some("/workspace")
+        );
+        let conflict: PartialMcpServerSpec = serde_json::from_value(
+            serde_json::json!({"type":"codex-app-server","command":"unexpected"}),
+        )
+        .unwrap();
+        assert_eq!(conflict.overlay(old).command.as_deref(), Some("unexpected"));
     }
 
     #[test]

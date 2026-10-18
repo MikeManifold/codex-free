@@ -326,6 +326,7 @@ fn codex_cli_server_to_spec(
         }
 
         return Ok(McpServerSpec {
+            app_server: None,
             command: None,
             args: Vec::new(),
             env: HashMap::new(),
@@ -394,6 +395,7 @@ fn codex_cli_server_to_spec(
     }
 
     Ok(McpServerSpec {
+        app_server: None,
         command: Some(command),
         args: server.transport.args.unwrap_or_default(),
         env,
@@ -596,6 +598,7 @@ fn parse_server(
 
         return Ok(ServerImport::Imported {
             spec: Box::new(McpServerSpec {
+                app_server: None,
                 command: Some(command),
                 args: optional_string_list(table, "args")?.unwrap_or_default(),
                 env,
@@ -646,6 +649,7 @@ fn parse_server(
 
     Ok(ServerImport::Imported {
         spec: Box::new(McpServerSpec {
+            app_server: None,
             command: None,
             args: Vec::new(),
             env: HashMap::new(),

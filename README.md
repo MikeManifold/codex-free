@@ -20,23 +20,25 @@ cargo run --release -- quickstart
 flowchart LR
     ChatGPT --> Tunnel[安全隧道] --> Free
     Free --> Local[本地文件、命令、Git]
-    Free --> MCP[其他 MCP 服务]
+    Free --> MCP[独立 MCP 服务]
+    Free <-->|stdio RPC| AppServer[官方 App Server]
+    AppServer --> UI[Chrome / macOS / Apps]
 ```
 
 Free 是一个 Rust 服务，负责执行和转发工具调用，模型在聊天侧运行。
 
 - 本地工具：文件读写、搜索、命令执行、Git、文件传输与预览。
 - 项目管理：多个项目共用一个服务，每个聊天选择自己的项目。
-- 可选扩展：接入其他 MCP；通过 Mac 桥接使用 Chrome 和原生 UI。
+- 可选扩展：接入独立 MCP；通过官方 App Server 使用 Chrome 和原生 UI。
 
-Mac 桥接是一个 Node.js 适配器，连接官方 Codex App Server，负责协议转换、运行时上下文、图片和确认表单。具体组件与调用过程见[架构说明](docs/ARCHITECTURE.md)。
+App Server 适配器在 Rust 内部，按需启动官方 CLI 子进程，处理运行时上下文、图片和确认表单；两者之间通过标准输入输出通信。上游工具名称和参数从运行中的服务读取。具体过程见[架构说明](docs/ARCHITECTURE.md)。
 
 ## 代码放在哪里
 
 | 目录 | 用途 |
 |---|---|
-| `src/` | Rust 主服务和本地工具 |
-| `integrations/` | 可选桥接与服务适配器 |
+| `src/` | Rust 主服务、本地工具和 App Server 接入 |
+| `integrations/` | 服务适配器与主机配置模板 |
 | `scripts/` | 安装、更新与签名 |
 | `tests/` | 回归测试 |
 | `docs/` | 架构与使用参考 |

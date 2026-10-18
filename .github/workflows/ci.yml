@@ -32,12 +32,10 @@ jobs:
         # exercises its own Tokio concurrency, without cross-test interference.
         run: cargo test --all -- --test-threads=1
 
+      # The separate Futu API signer still uses Node's crypto implementation.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Bridge protocol tests
-        run: node --test tests/test_bridge_config.mjs tests/test_bridge_confirmations.mjs tests/test_bridge_confirmation_stdio.mjs tests/test_codex_app_server_bridge.mjs
 
       - name: Installer policy tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v

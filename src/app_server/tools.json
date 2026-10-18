@@ -1,0 +1,501 @@
+[
+  {
+    "name": "codex_confirmations_list",
+    "description": "List only this caller's pending App Server confirmations. Show the actual form/message to the human. Never infer consent or repeat the original pending tool call.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "codex_confirmation_respond",
+    "description": "Reply once to a pending confirmation only after the human explicitly answers that exact form. Set userConfirmed=true only for an actual user decision. Content must contain the user's supplied fields, never fabricated approval. Device verification requires the supported Codex UI. Returns the original operation result or its pending status; do not recreate an operation.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "confirmationId",
+        "action",
+        "userConfirmed"
+      ],
+      "properties": {
+        "operationId": {
+          "type": "string"
+        },
+        "confirmationId": {
+          "type": "string"
+        },
+        "action": {
+          "enum": [
+            "accept",
+            "decline",
+            "cancel"
+          ]
+        },
+        "userConfirmed": {
+          "type": "boolean"
+        },
+        "content": {
+          "description": "Actual structured user input required for accepted forms."
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_operation_result",
+    "description": "Retrieve the result of an existing bridge operation, including native image blocks. Poll this after confirmation; never repeat a pending write or create call.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId"
+      ],
+      "properties": {
+        "operationId": {
+          "type": "string"
+        },
+        "waitMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30000
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_app_status",
+    "description": "Check the local Codex App bridge, App Server initialization, configured work directory, and MCP status without starting a model turn.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  {
+    "name": "codex_exec",
+    "description": "Execute an argv-vector command through Codex App Server command/exec. This uses Codex's own local execution environment and configured sandbox; it does not create a model turn.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "argv vector, e.g. [\"python3\",\"-c\",\"print(2+2)\"]"
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Absolute working directory. Defaults to the configured project directory."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600000
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_fs_read",
+    "description": "Read a local file through Codex App Server fs/readFile. The path is an absolute Mac path; Codex App owns filesystem policy.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "base64"
+          ]
+        },
+        "followSymlinks": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_fs_write",
+    "description": "Write a local file through Codex App Server fs/writeFile. This uses App Server native filesystem RPC rather than codex-free review checkpoints.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "content"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "base64"
+          ]
+        },
+        "followSymlinks": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_fs_list",
+    "description": "List a local directory through Codex App Server fs/readDirectory.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_mcp_status",
+    "description": "List MCP servers as seen by Codex App Server, including runtime/tool/auth status. This uses Codex's native MCP registry rather than re-parsing config files.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serverName": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string",
+          "enum": [
+            "full",
+            "toolsAndAuthOnly"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_mcp_call",
+    "description": "Call an MCP tool through Codex App Server. The bridge creates an ephemeral utility thread only as MCP runtime scope and never starts a model turn.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "server",
+        "tool"
+      ],
+      "properties": {
+        "server": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_mcp_oauth_login",
+    "description": "Start Codex App Server native OAuth login for a configured MCP server. Codex owns token storage and refresh; this bridge never reads refresh tokens.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_cua_docs",
+    "description": "Return the live documentation generated by Codex unified Computer Use / Browser runtime. Use before writing nontrivial cua JavaScript.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  {
+    "name": "codex_cua_state",
+    "description": "Get the native apps and browser backends actually exposed by this runtime. Check this before browser actions. The standalone CLI bridge normally exposes Chrome and native Computer Use; an in-app browser requires a desktop-provided context and must not be assumed available.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  {
+    "name": "codex_cua_js",
+    "description": "Execute JavaScript in the unified Computer Use runtime (cua_repl when available, otherwise the trusted node_repl runtime). Use codex_cua_state to discover available backends first. Chrome and native macOS control can work independently of a desktop in-app browser; do not substitute another backend after an access denial.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300000
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_skills_list",
+    "description": "List skills through Codex App Server using the same Codex home and project cwd.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "forceReload": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_plugins_list",
+    "description": "List plugins through Codex App Server, including bundled Computer Use and app-managed plugins.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "forceRefetch": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_apps_list",
+    "description": "List Codex Apps/connectors through App Server, using the same installed/connected app catalog as Codex Desktop.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "runtime",
+            "directory"
+          ],
+          "description": "runtime (default) reads the already loaded codex_apps MCP catalog; directory explicitly queries the remote App directory."
+        },
+        "forceRefetch": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "cursor": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_apps_read",
+    "description": "Read metadata and optional public tool summaries for selected Codex Apps/connectors.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "appIds"
+      ],
+      "properties": {
+        "appIds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "string"
+          }
+        },
+        "includeTools": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "runtime",
+            "directory"
+          ],
+          "description": "runtime (default) reads the already loaded codex_apps MCP catalog."
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_permissions_list",
+    "description": "List Codex permission profiles resolved for the configured project cwd.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "cursor": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_projects_list",
+    "description": "List projects known to Codex App Server without creating a model turn.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "sortKey": {
+          "type": "string",
+          "enum": [
+            "position",
+            "recencyAt"
+          ]
+        },
+        "sortDirection": {
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_hooks_list",
+    "description": "List Codex hooks resolved for the configured project cwd.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  {
+    "name": "codex_models_list",
+    "description": "List models exposed by this Codex App Server runtime.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "includeHidden": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "cursor": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "codex_account_read",
+    "description": "Read the Codex account/session identity summary through App Server. Does not expose OAuth refresh tokens.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  {
+    "name": "codex_remote_control_status",
+    "description": "Read Codex App Server remote-control status without enabling or changing remote control.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  {
+    "name": "codex_capabilities",
+    "description": "Summarize Codex App-managed MCP servers, skills, plugins, permission profiles, and app-server execution availability without starting a model turn.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {}
+    }
+  },
+  {
+    "name": "codex_rpc",
+    "description": "Advanced escape hatch for an allowlisted Codex App Server RPC. By default only read/diagnostic/app-server capability methods are allowed. Set CODEX_APP_BRIDGE_ALLOW_RAW_RPC=1 to permit arbitrary methods.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method"
+      ],
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "params": {}
+      }
+    }
+  }
+]

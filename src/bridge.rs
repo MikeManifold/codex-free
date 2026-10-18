@@ -34,6 +34,12 @@ use crate::process_env::scrub_untrusted_child_env;
 use crate::tool::{Tool, ToolCallIdentity, ToolRequestContext};
 use crate::types::{AppConfig, McpToolExposure, ToolContent, ToolResult};
 
+#[derive(Clone)]
+pub(crate) enum UpstreamPeer {
+    Mcp(Peer<RoleClient>),
+    AppServer(std::sync::Arc<crate::app_server::AppServerBridge>),
+}
+
 /// How long to wait for an upstream to start up and answer `tools/list` before
 /// giving up on it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -42,6 +48,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// into the registry, plus the running services kept alive for the server's
 /// lifetime (dropping one closes its transport and any child process).
 pub struct Bridge {
+    pub(crate) app_servers: Vec<crate::app_server::AppServerGuard>,
     pub tools: Vec<Box<dyn Tool>>,
     /// Held only to keep upstream transports alive; never read directly.
     pub services: Vec<RunningService<RoleClient, ()>>,
@@ -66,7 +73,7 @@ struct BridgedTool {
     annotations: Option<ToolAnnotations>,
     icons: Option<Vec<Icon>>,
     meta: Option<MetaObject>,
-    peer: Peer<RoleClient>,
+    peer: UpstreamPeer,
     tool_timeout: Option<Duration>,
 }
 
@@ -184,13 +191,29 @@ pub(crate) fn attach_call_owner(
 }
 
 pub(crate) async fn forward_tool_call(
-    peer: &Peer<RoleClient>,
+    peer: &UpstreamPeer,
     params: CallToolRequestParams,
     server: &str,
     tool: &str,
     tool_timeout: Option<Duration>,
     cancellation: Option<&CancellationToken>,
 ) -> ToolResult {
+    if let UpstreamPeer::AppServer(adapter) = peer {
+        let call = adapter.call(params, cancellation);
+        return match tool_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, call)
+                .await
+                .unwrap_or_else(|_| {
+                    ToolResult::error(
+                        "App Server tool timed out; inspect original state before retrying",
+                    )
+                }),
+            None => call.await,
+        };
+    }
+    let UpstreamPeer::Mcp(peer) = peer else {
+        unreachable!()
+    };
     let result = call_upstream_tool(peer, params, tool_timeout, cancellation).await;
 
     match result {
@@ -268,7 +291,7 @@ async fn call_upstream_tool(
 /// preserving text, images, error state, structured content, and result metadata.
 /// Content blocks this server has no native representation for are rendered as
 /// JSON text so nothing is silently dropped.
-fn map_call_result(result: CallToolResult) -> ToolResult {
+pub(crate) fn map_call_result(result: CallToolResult) -> ToolResult {
     let content: Vec<ToolContent> = result
         .content
         .into_iter()
@@ -346,6 +369,7 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
     let mut services: Vec<RunningService<RoleClient, ()>> = Vec::new();
     let mut report: Vec<String> = Vec::new();
     let mut catalog_sources = Vec::new();
+    let mut app_servers = Vec::new();
 
     // Deterministic order so logs and tool ordering are stable across runs.
     let mut names: Vec<&String> = config.mcp_servers.keys().collect();
@@ -360,9 +384,43 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
         let sanitized = sanitize(server_name);
         let exposure = spec.exposure();
 
-        match connect_one(server_name, spec, config).await {
-            Ok((service, upstream_tools, tool_timeout)) => {
-                let peer = service.peer().clone();
+        let connected = if spec.transport.as_deref() == Some("codex-app-server") {
+            if spec.command.is_some()
+                || spec.url.is_some()
+                || !spec.args.is_empty()
+                || spec.bearer_token_env_var.is_some()
+                || !spec.http_headers.is_empty()
+                || !spec.env_http_headers.is_empty()
+                || spec.shared_codex_oauth
+            {
+                Err(
+                    "Native App Server cannot contain an MCP command, URL, or HTTP authorization"
+                        .into(),
+                )
+            } else {
+                crate::app_server::AppServerBridge::new(spec, config).and_then(|adapter| {
+                    let timeout =
+                        configured_timeout(spec.tool_timeout_sec, "toolTimeoutSec", None)?;
+                    let tools = crate::app_server::AppServerBridge::tools()
+                        .into_iter()
+                        .filter(|t| tool_is_enabled(spec, t.name.as_ref()))
+                        .collect();
+                    let info = Some(crate::app_server::AppServerBridge::info());
+                    app_servers.push(adapter.guard());
+                    Ok((None, UpstreamPeer::AppServer(adapter), info, tools, timeout))
+                })
+            }
+        } else {
+            connect_one(server_name, spec, config)
+                .await
+                .map(|(service, tools, timeout)| {
+                    let peer = UpstreamPeer::Mcp(service.peer().clone());
+                    let info = service.peer().peer_info();
+                    (Some(service), peer, info, tools, timeout)
+                })
+        };
+        match connected {
+            Ok((service, peer, info, upstream_tools, tool_timeout)) => {
                 let count = upstream_tools.len();
 
                 match exposure {
@@ -440,7 +498,7 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                             raw_name: server_name.clone(),
                             provenance: spec.provenance,
                             transport: transport_label(spec),
-                            peer_info: peer.peer_info(),
+                            peer_info: info,
                             tools: upstream_tools,
                             peer: peer.clone(),
                             tool_timeout,
@@ -450,7 +508,9 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
                         );
                     }
                 }
-                services.push(service);
+                if let Some(service) = service {
+                    services.push(service);
+                }
             }
             Err(e) => {
                 report.push(format!("{server_name} -> FAILED: {e}"));
@@ -464,6 +524,7 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
     tools = catalog_tools;
 
     Bridge {
+        app_servers,
         tools,
         services,
         report,
@@ -564,7 +625,7 @@ struct GatewayTool {
     server: String,
     description: String,
     function_names: Vec<String>,
-    peer: Peer<RoleClient>,
+    peer: UpstreamPeer,
     tool_timeout: Option<Duration>,
 }
 
@@ -698,7 +759,9 @@ enum UpstreamTransport<'a> {
 }
 
 fn transport_label(spec: &crate::types::McpServerSpec) -> String {
-    if spec.command.is_some() {
+    if spec.transport.as_deref() == Some("codex-app-server") {
+        "app-server-rpc".to_string()
+    } else if spec.command.is_some() {
         "stdio".to_string()
     } else {
         "streamable-http".to_string()
@@ -706,6 +769,9 @@ fn transport_label(spec: &crate::types::McpServerSpec) -> String {
 }
 
 fn select_transport(spec: &crate::types::McpServerSpec) -> Result<UpstreamTransport<'_>, String> {
+    if spec.app_server.is_some() {
+        return Err("appServer settings require type=codex-app-server".into());
+    }
     if spec.command.is_some() && spec.url.is_some() {
         return Err("both \"command\" and \"url\" are configured".to_string());
     }
@@ -2179,7 +2245,7 @@ mod tests {
         assert_eq!(tools.len(), 2);
 
         let echo = forward_tool_call(
-            service.peer(),
+            &UpstreamPeer::Mcp(service.peer().clone()),
             CallToolRequestParams::new("echo")
                 .with_arguments(json!({ "text": "hello" }).as_object().cloned().unwrap()),
             "remote",
@@ -2192,7 +2258,7 @@ mod tests {
         assert_eq!(echo.joined_text(), "hello");
 
         let slow = forward_tool_call(
-            service.peer(),
+            &UpstreamPeer::Mcp(service.peer().clone()),
             CallToolRequestParams::new("slow")
                 .with_arguments(json!({ "text": "late" }).as_object().cloned().unwrap()),
             "remote",
@@ -2214,7 +2280,7 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let cancelled = forward_tool_call(
-            service.peer(),
+            &UpstreamPeer::Mcp(service.peer().clone()),
             CallToolRequestParams::new("slow")
                 .with_arguments(json!({ "text": "cancelled" }).as_object().cloned().unwrap()),
             "remote",
