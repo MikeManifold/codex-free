@@ -149,7 +149,7 @@ async fn setup_script_runs_only_when_the_opt_in_is_enabled() {
 }
 
 #[tokio::test]
-async fn auto_mode_uses_the_source_checkout_once_then_creates_a_worktree() {
+async fn auto_mode_uses_local_directories_directly_across_conversations_and_restarts() {
     let root = TempDir::new().unwrap();
     let (access_root, project_root) = repository(&root);
     let config = config(&root, access_root, WorktreeMode::Auto);
@@ -168,38 +168,79 @@ async fn auto_mode_uses_the_source_checkout_once_then_creates_a_worktree() {
         .select_project_root(&config, &second_identity, "demo")
         .await
         .unwrap();
-    assert!(second.managed_worktree);
-    assert_ne!(second.project_root, first.project_root);
+    assert!(!second.managed_worktree);
+    assert_eq!(second.project_root, first.project_root);
     assert_eq!(
         fs::read_to_string(second.project_root.join("tracked.txt")).unwrap(),
         "tracked\n"
     );
-    // Compare through `fs::canonicalize` on both sides: the returned root is a
-    // plain path (the `\\?\` verbatim prefix is stripped so git can use it),
-    // while canonicalizing the configured root re-adds that prefix on Windows.
-    assert_eq!(
-        fs::canonicalize(second.worktrees_root.as_ref().unwrap()).unwrap(),
-        fs::canonicalize(&config.worktrees.root).unwrap()
-    );
-    assert_eq!(
-        git(
-            second.worktree_git_root.as_ref().unwrap(),
-            &["rev-parse", "--is-inside-work-tree"]
-        ),
-        "true"
-    );
+    assert!(second.worktrees_root.is_none());
+    assert!(!config.worktrees.root.exists());
 
     let restarted = ProjectBindingStore::new(bindings);
     let restored = restarted
         .selected_project_root(&config, &second_identity)
         .unwrap()
-        .expect("the worktree binding must survive a restart");
+        .expect("the directory binding must survive a restart");
     // Both name the same directory; canonicalize so the comparison ignores
     // Windows path-form differences (verbatim prefix, trailing separator).
     assert_eq!(
         fs::canonicalize(&restored).unwrap(),
         fs::canonicalize(&second.project_root).unwrap()
     );
+}
+
+#[tokio::test]
+async fn auto_mode_switches_to_an_unborn_parent_already_used_by_another_conversation() {
+    let root = TempDir::new().unwrap();
+    let access = root.path().join("projects");
+    let child = access.join("child");
+    fs::create_dir_all(&child).unwrap();
+    git(&access, &["init", "--quiet"]);
+    fs::write(child.join("keep.txt"), "keep\n").unwrap();
+    let original_head = fs::read(access.join(".git/HEAD")).unwrap();
+    let config = config(&root, access.clone(), WorktreeMode::Auto);
+    let bindings = root.path().join("bindings");
+    let store = ProjectBindingStore::new(bindings.clone());
+    let current = identity("switch-current");
+    let other = identity("switch-other");
+    store
+        .select_project_root(&config, &current, "child")
+        .await
+        .unwrap();
+    store
+        .select_project_root(&config, &other, ".")
+        .await
+        .unwrap();
+
+    let selection = store
+        .switch_project_root(&config, &current, ".", "child")
+        .await
+        .unwrap();
+    assert!(!selection.managed_worktree);
+    assert_eq!(selection.project_root, fs::canonicalize(&access).unwrap());
+    assert!(!config.worktrees.root.exists());
+    assert_eq!(fs::read(access.join(".git/HEAD")).unwrap(), original_head);
+    assert_eq!(
+        fs::read_to_string(child.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(
+        !Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&access)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let restarted = ProjectBindingStore::new(bindings);
+    for caller in [&current, &other] {
+        assert_eq!(
+            restarted.selected_project_root(&config, caller).unwrap(),
+            Some(fs::canonicalize(&access).unwrap())
+        );
+    }
 }
 
 #[tokio::test]
@@ -427,7 +468,7 @@ async fn explicit_modes_override_auto_allocation() {
 }
 
 #[tokio::test]
-async fn concurrent_auto_bindings_claim_one_source_checkout_and_one_worktree() {
+async fn concurrent_auto_bindings_use_the_requested_local_directory() {
     let root = TempDir::new().unwrap();
     let (access_root, project_root) = repository(&root);
     let config = config(&root, access_root, WorktreeMode::Auto);
@@ -456,14 +497,14 @@ async fn concurrent_auto_bindings_claim_one_source_checkout_and_one_worktree() {
             .iter()
             .filter(|selection| selection.managed_worktree)
             .count(),
-        1
+        0
     );
     assert_eq!(
         selections
             .iter()
             .filter(|selection| !selection.managed_worktree)
             .count(),
-        1
+        2
     );
     assert_eq!(
         selections
@@ -473,4 +514,5 @@ async fn concurrent_auto_bindings_claim_one_source_checkout_and_one_worktree() {
             .project_root,
         fs::canonicalize(project_root).unwrap()
     );
+    assert!(!config.worktrees.root.exists());
 }

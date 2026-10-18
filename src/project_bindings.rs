@@ -326,9 +326,16 @@ impl ProjectBindingStore {
 
         let assignment_path = self.assignment_path(&access_root, &source_project_root);
         let assignment_lock = acquire_lock(&assignment_path).await?;
-        let scan = self.scan_source_assignments(&access_root, &source_project_root);
+        let mut warnings = prepared.warnings;
         let create_worktree = match config.worktrees.mode {
-            WorktreeMode::Auto => scan.assigned || requires_target_worktree,
+            // Selecting a local directory must not depend on Git or on whether
+            // another conversation already uses that directory.
+            WorktreeMode::Auto if matches!(reference, ProjectReference::Path(_)) => false,
+            WorktreeMode::Auto => {
+                let scan = self.scan_source_assignments(&access_root, &source_project_root);
+                warnings.extend(scan.warnings);
+                scan.assigned || requires_target_worktree
+            }
             WorktreeMode::Always => true,
             WorktreeMode::Never if requires_target_worktree => {
                 return Err(format!(
@@ -338,9 +345,6 @@ impl ProjectBindingStore {
             }
             WorktreeMode::Never => false,
         };
-        let mut warnings = prepared.warnings;
-        warnings.extend(scan.warnings);
-
         let managed = if create_worktree {
             let worktree = create_managed_worktree_at(
                 config,

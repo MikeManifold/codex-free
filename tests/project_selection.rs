@@ -257,6 +257,43 @@ async fn sessions_are_isolated_to_their_selected_roots() {
 }
 
 #[tokio::test]
+async fn transport_auto_mode_accepts_plain_and_unborn_local_directories() {
+    for unborn in [false, true] {
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        if unborn {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(&project)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut config = multi_project_config(root.path());
+        config.worktrees.mode = WorktreeMode::Auto;
+        config.worktrees.root = root.path().join("managed");
+        for _ in 0..2 {
+            let session = SessionState::new();
+            let selected = session
+                .select_project_root(&config, "project")
+                .await
+                .unwrap();
+            assert!(!selected.managed_worktree);
+            assert_eq!(selected.project_root, project.canonicalize().unwrap());
+            assert_eq!(
+                session.effective_config(&config).unwrap().work_dir,
+                selected.project_root
+            );
+        }
+        assert!(!config.worktrees.root.exists());
+        assert_eq!(project.join(".git").exists(), unborn);
+    }
+}
+
+#[tokio::test]
 async fn transport_project_binding_fails_closed_when_the_selected_root_disappears() {
     let root = TempDir::new().unwrap();
     let access = root.path().join("projects");

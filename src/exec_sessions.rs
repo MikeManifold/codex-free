@@ -879,7 +879,11 @@ impl SessionState {
                 source_project_root.display()
             ));
         }
-        let create_worktree = config.worktrees.mode != WorktreeMode::Never;
+        let create_worktree = match config.worktrees.mode {
+            WorktreeMode::Auto => matches!(reference, ProjectReference::GitHub(_)),
+            WorktreeMode::Always => true,
+            WorktreeMode::Never => false,
+        };
         let managed = if create_worktree {
             Some(
                 create_managed_worktree_at(

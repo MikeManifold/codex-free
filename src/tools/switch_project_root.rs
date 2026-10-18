@@ -14,7 +14,7 @@ impl Tool for SwitchProjectRoot {
         "switch_project_root"
     }
     fn description(&self) -> String {
-        "Explicitly switch this ChatGPT conversation to another source project only when the human requested that switch. Supply the current source root as expected_project_root and confirm=true. The default set_project_root remains immutable. Refuses while native resident commands are active, serializes against in-flight project calls, backs up the old binding, and leaves project files/worktrees/review checkpoints intact. Finish independent upstream operations first. After success call get_agent_brief for the new project. Also callable through mcp_call_tool with source=local_projects, tool=switch.".into()
+        "Explicitly switch this ChatGPT conversation to another source project only when the human requested that switch. Supply the current source root as expected_project_root and confirm=true. In default auto mode, switching to a local directory does not require Git or create a worktree. The default set_project_root remains immutable. Refuses while native resident commands are active, serializes against in-flight project calls, backs up the old binding, and leaves project files/worktrees/review checkpoints intact. Finish independent upstream operations first. After success call get_agent_brief for the new project. Also callable through mcp_call_tool with source=local_projects, tool=switch.".into()
     }
     fn annotations(&self) -> Option<ToolAnnotations> {
         Some(
@@ -129,7 +129,7 @@ mod tests {
         std::fs::write(first.join("keep.txt"), "original").unwrap();
         let mut config = crate::config::default_config(access);
         config.multi_project = true;
-        config.worktrees.mode = crate::types::WorktreeMode::Never;
+        config.worktrees.mode = crate::types::WorktreeMode::Auto;
         let store = Arc::new(ProjectBindingStore::new(temp.path().join("bindings")));
         let a = ConversationIdentity::from_openai_session("fixture-a").unwrap();
         let b = ConversationIdentity::from_openai_session("fixture-b").unwrap();
