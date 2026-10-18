@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Interactive view</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: var(--color-background-primary, light-dark(#fff, #171717));
+  --panel: var(--color-background-secondary, light-dark(#f6f7f8, #222));
+  --text: var(--color-text-primary, light-dark(#171717, #f4f4f4));
+  --muted: var(--color-text-secondary, light-dark(#62666d, #a7a7a7));
+  --border: var(--color-border-primary, light-dark(#d9dce1, #3a3a3a));
+  font-family: var(--font-sans, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { margin: 0; width: 100%; background: transparent; color: var(--text); }
+main { display: grid; width: 100%; gap: 6px; }
+.toolbar { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 4px 6px; }
+.heading { min-width: 0; flex: 1 1 auto; }
+.title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 650; }
+.path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
+button {
+  min-height: 28px; padding: 0 9px;
+  border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); background: var(--panel); cursor: pointer;
+}
+[hidden] { display: none !important; }
+.frame-shell {
+  width: 100%; min-height: 260px; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--bg);
+}
+iframe { display: block; width: 100%; height: 540px; border: 0; background: transparent; }
+.notice { padding: 16px; color: var(--muted); font-size: 12px; text-align: center; }
+.frame-shell.compact { min-height: 0; }
+.preview { padding: 12px; overflow: auto; }
+.preview img { display: block; max-width: 100%; max-height: 100%; margin: auto; object-fit: contain; }
+.preview pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 ui-monospace, monospace; }
+.preview table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 12px; }
+.preview td { border: 1px solid var(--border); padding: 6px 9px; white-space: pre-wrap; max-width: 600px; overflow-wrap: anywhere; }
+.preview caption { text-align: left; margin-bottom: 8px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <div class="toolbar">
+    <div class="heading">
+      <div class="title" id="title">Preparing interactive view…</div>
+      <div class="path" id="path"></div>
+    </div>
+    <button id="fullscreen" type="button" hidden>全屏</button>
+  </div>
+  <div class="frame-shell" id="shell">
+    <div class="notice" id="notice" role="status" aria-live="polite">Waiting for tool output…</div>
+    <div class="preview" id="preview" hidden></div>
+    <iframe id="frame" sandbox="allow-scripts allow-forms allow-pointer-lock" hidden></iframe>
+  </div>
+</main>
+<script>
+(() => {
+  "use strict";
+  const META_KEY = "io.github.hypnguyen1209/local-ui";
+  const ids = ["title", "path", "frame", "preview", "notice", "fullscreen", "shell"];
+  const [title, path, frame, preview, notice, fullscreen, shell] = ids.map(id => document.getElementById(id));
+  const MAX_CHARS = 3 * 1024 * 1024;
+  const MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/svg+xml"]);
+  let nextId = 1, revision = 0, displayed = false, hasPayload = false, resizeObserver, tornDown = false, settled = false;
+  const pending = new Map();
+  const timers = new Set();
+  function later(fn, ms) {
+    const id = setTimeout(() => { timers.delete(id); if (!tornDown) fn(); }, ms);
+    timers.add(id);
+    return id;
+  }
+  function cancel(id) { clearTimeout(id); timers.delete(id); }
+  function post(message) { if (!tornDown) window.parent.postMessage(message, "*"); }
+  function notify(method, params) { post({ jsonrpc: "2.0", method, params }); }
+  function request(method, params) {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = later(() => {
+        pending.delete(id);
+        reject(new Error("Host did not respond in time"));
+      }, 10000);
+      pending.set(id, { resolve, reject, timer });
+      post({ jsonrpc: "2.0", id, method, params });
+    });
+  }
+  function resultInfo(value) {
+    const queue = [value], seen = new Set();
+    const keys = ["_meta", "meta", "call_tool_result", "callToolResult", "mcp_tool_result", "mcpToolResult", "result"];
+    let payload = null, failed = false, finalEnvelope = false;
+    while (queue.length && seen.size < 64) {
+      const current = queue.shift();
+      if (!current || typeof current !== "object" || seen.has(current)) continue;
+      seen.add(current);
+      if (current[META_KEY] && typeof current[META_KEY] === "object") payload = current[META_KEY];
+      if (current.isError === true) failed = true;
+      if (Array.isArray(current.content) || typeof current.isError === "boolean") finalEnvelope = true;
+      for (const key of keys) if (current[key] && typeof current[key] === "object") queue.push(current[key]);
+    }
+    return { payload, failed, finalEnvelope };
+  }
+  function reportSize() {
+    if (tornDown) return;
+    const height = Math.ceil(document.documentElement.scrollHeight);
+    notify("ui/notifications/size-changed", { width: Math.ceil(document.documentElement.clientWidth), height });
+    try { window.openai?.notifyIntrinsicHeight?.(height); } catch (_) {}
+  }
+  function clearSurface() {
+    revision++;
+    frame.onload = frame.onerror = null;
+    frame.hidden = preview.hidden = true;
+    // Remove prior running content, including its scripts, when replacing a preview.
+    frame.removeAttribute("srcdoc");
+    preview.replaceChildren();
+    displayed = false;
+  }
+  function showStatus(heading, message) {
+    clearSurface();
+    title.textContent = heading;
+    notice.textContent = message;
+    notice.hidden = false;
+    shell.classList.add("compact");
+    reportSize();
+  }
+  function parseDelimited(text, delimiter) {
+    // Bounded CSV/TSV parser: quoted newlines, doubled quotes, CRLF and empty cells.
+    text = text.replace(/^\uFEFF/, "");
+    const rows = [];
+    let row = [], field = "", state = "start", cells = 0;
+    function cell() {
+      if (row.length >= 200 || ++cells > 20000) throw new Error("Table is too large (200 columns / 20000 cells maximum)");
+      row.push(field); field = ""; state = "start";
+    }
+    function line() {
+      cell();
+      if (rows.length >= 2000) throw new Error("Table is too large (2000 rows maximum)");
+      rows.push(row); row = [];
+    }
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (state === "quoted") {
+        if (ch === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else state = "closed";
+        } else field += ch;
+        continue;
+      }
+      if (ch === delimiter) { cell(); continue; }
+      if (ch === "\n" || ch === "\r") {
+        if (ch === "\r" && text[i + 1] === "\n") i++;
+        line(); continue;
+      }
+      if (state === "closed") throw new Error("Unexpected character after closing quote");
+      if (ch === '"') {
+        if (state !== "start") throw new Error("Unexpected quote in unquoted field");
+        state = "quoted";
+      } else { field += ch; state = "plain"; }
+    }
+    if (state === "quoted") throw new Error("Unclosed quoted field");
+    if (state !== "start" || field || row.length) line();
+    return rows;
+  }
+  function textValue(value) {
+    if (typeof value !== "string" || value.length > MAX_CHARS) throw new Error("Missing, invalid or oversized preview content");
+    return value;
+  }
+  function render(payload) {
+    hasPayload = settled = true;
+    cancel(waitTimer);
+    clearSurface();
+    const currentRevision = revision;
+    const kind = payload.kind || (typeof payload.html === "string" ? "html" : "");
+    const heading = typeof payload.title === "string" ? payload.title.slice(0, 200) : "Project preview";
+    title.textContent = document.title = heading;
+    path.textContent = typeof payload.sourcePath === "string" ? payload.sourcePath : "";
+    const requested = Number(payload.height);
+    const height = Number.isFinite(requested) ? Math.max(260, Math.min(1000, requested)) : 540;
+    frame.style.height = preview.style.height = `${height}px`;
+    preview.style.maxHeight = "none";
+    shell.classList.remove("compact");
+    notice.hidden = false;
+    notice.textContent = "Loading preview…";
+    function ready() {
+      if (revision !== currentRevision || tornDown) return;
+      displayed = true;
+      notice.hidden = true;
+      reportSize();
+    }
+    function failed(message) {
+      if (revision !== currentRevision || tornDown) return;
+      showStatus("Preview unavailable", message);
+    }
+    try {
+      if (kind === "html") {
+        const html = textValue(payload.html);
+        frame.onload = ready;
+        frame.onerror = () => failed("The HTML frame could not load");
+        frame.srcdoc = html;
+        frame.hidden = false;
+        later(() => { if (!displayed) failed("No HTML frame load event received; check the host's frame/CSP settings"); }, 20000);
+      } else if (kind === "image") {
+        if (!MIME_TYPES.has(payload.mimeType)) throw new Error("Unsupported image MIME type");
+        const data = textValue(payload.data);
+        if (!data || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) throw new Error("Invalid base64 image");
+        const image = document.createElement("img");
+        image.alt = heading;
+        image.onload = ready;
+        image.onerror = () => failed("Image could not be decoded or was blocked by the host");
+        // SVG is an image, never live inline markup.
+        image.src = `data:${payload.mimeType};base64,${data}`;
+        preview.append(image); preview.hidden = false;
+        later(() => { if (!displayed) failed("Image loading timed out"); }, 20000);
+      } else if (kind === "csv" || kind === "tsv") {
+        preview.style.height = "auto";
+        preview.style.maxHeight = `${height}px`;
+        shell.classList.add("compact");
+        const rows = parseDelimited(textValue(payload.text), kind === "tsv" ? "\t" : ",");
+        const table = document.createElement("table");
+        const caption = document.createElement("caption");
+        caption.textContent = `${rows.length} rows · source order preserved`;
+        table.append(caption);
+        const body = document.createElement("tbody");
+        for (const cells of rows) {
+          const tr = document.createElement("tr");
+          for (const value of cells) {
+            const td = document.createElement("td");
+            td.textContent = value; tr.append(td);
+          }
+          body.append(tr);
+        }
+        table.append(body); preview.append(table); preview.hidden = false; ready();
+      } else if (kind === "text" || kind === "json") {
+        preview.style.height = "auto";
+        preview.style.maxHeight = `${height}px`;
+        shell.classList.add("compact");
+        const source = textValue(payload.text);
+        if (kind === "json") JSON.parse(source); // Validate only; display the exact numbers/text.
+        const pre = document.createElement("pre");
+        pre.textContent = source; preview.append(pre); preview.hidden = false; ready();
+      } else throw new Error("This result has no supported preview kind");
+    } catch (error) { failed(error.message || "Could not prepare preview"); }
+    reportSize();
+  }
+  function receive(value, terminal = false) {
+    const info = resultInfo(value);
+    if (info.failed) {
+      settled = true;
+      cancel(waitTimer);
+      showStatus("Preview failed", "The tool returned an error. See the tool result for details.");
+    } else if (info.payload) render(info.payload);
+    else if ((terminal || info.finalEnvelope) && !hasPayload) {
+      settled = true;
+      cancel(waitTimer);
+      showStatus("No preview data", "This result contains no preview. Ordinary tool outputs do not need a render window.");
+    }
+    // A later valid result is still accepted after empty results or a timeout.
+  }
+  function applyHostContext(context) {
+    if (context && ["light", "dark"].includes(context.theme)) document.documentElement.dataset.theme = context.theme;
+  }
+  const waitTimer = later(() => {
+    if (!settled) showStatus("No preview received", "The tool has not delivered preview data. It may still complete later.");
+  }, 30000);
+  window.addEventListener("message", event => {
+    if (tornDown || event.source !== window.parent) return;
+    const message = event.data;
+    if (!message || message.jsonrpc !== "2.0") return;
+    if (Object.hasOwn(message, "id") && (Object.hasOwn(message, "result") || Object.hasOwn(message, "error"))) {
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id); cancel(waiter.timer);
+      Object.hasOwn(message, "error") ? waiter.reject(message.error) : waiter.resolve(message.result);
+    } else if (message.method === "ui/notifications/tool-result") receive(message.params, true);
+    else if (message.method === "ui/notifications/tool-cancelled") {
+      settled = true;
+      cancel(waitTimer); showStatus("Preview cancelled", "The tool call was cancelled.");
+    } else if (message.method === "ui/notifications/host-context-changed") applyHostContext(message.params);
+    else if (message.method === "ui/resource-teardown" && message.id !== undefined) {
+      clearSurface();
+      resizeObserver?.disconnect();
+      for (const timer of [...timers]) cancel(timer);
+      for (const waiter of pending.values()) waiter.reject(new Error("View closed"));
+      pending.clear();
+      post({ jsonrpc: "2.0", id: message.id, result: {} });
+      tornDown = true;
+    }
+  });
+  window.addEventListener("openai:set_globals", event => {
+    if (tornDown) return;
+    const globals = event.detail?.globals;
+    if (!globals) return;
+    if (Object.hasOwn(globals, "toolResponseMetadata")) receive(globals.toolResponseMetadata);
+    if (globals.toolOutput && resultInfo(globals.toolOutput).finalEnvelope) receive(globals.toolOutput);
+  });
+  if (window.openai?.toolResponseMetadata) receive(window.openai.toolResponseMetadata);
+  if (window.openai?.requestDisplayMode) {
+    fullscreen.hidden = false;
+    fullscreen.addEventListener("click", () => {
+      window.openai.requestDisplayMode({ mode: "fullscreen" }).catch(() => {});
+    });
+  }
+  request("ui/initialize", {
+    protocolVersion: "2026-01-26",
+    appInfo: { name: "codex-free-local-ui", version: "2.0.0" }, appCapabilities: {}
+  }).then(result => {
+    if (tornDown) return;
+    applyHostContext(result?.hostContext);
+    notify("ui/notifications/initialized", {});
+    if ("ResizeObserver" in window) {
+      resizeObserver = new ResizeObserver(reportSize); resizeObserver.observe(document.documentElement);
+    }
+    reportSize();
+  }).catch(() => {
+    if (!tornDown && !settled) showStatus("Host connection unavailable", "No UI initialization response; waiting for a compatible result channel.");
+  });
+})();
+</script>
+</body>
+</html>

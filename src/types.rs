@@ -543,6 +543,10 @@ pub struct McpServerSpec {
     /// Header-name to environment-variable mappings resolved at connection time.
     #[serde(default)]
     pub env_http_headers: std::collections::HashMap<String, String>,
+    /// Read Codex's file-backed MCP OAuth access token for this HTTP source.
+    /// Never writes credentials or independently refreshes a token.
+    #[serde(default)]
+    pub shared_codex_oauth: bool,
     /// Timeout for initialization and the first tools listing, in seconds.
     #[serde(default)]
     pub startup_timeout_sec: Option<f64>,

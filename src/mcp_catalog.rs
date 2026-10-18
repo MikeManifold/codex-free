@@ -8,7 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rmcp::RoleClient;
 use rmcp::model::{
-    CallToolRequestParams, Implementation, ServerPeerInfo, Tool as McpTool, ToolAnnotations,
+    CallToolRequestParams, Implementation, MetaObject, ServerPeerInfo, Tool as McpTool,
+    ToolAnnotations,
 };
 use rmcp::service::Peer;
 use serde_json::{Map, Value, json};
@@ -16,13 +17,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bridge::forward_tool_call;
 use crate::exec_sessions::SessionState;
+use crate::local_ui;
 use crate::tool::{Tool, ToolCallIdentity, ToolRequestContext};
+use crate::tools::exec_command::ExecCommand;
+use crate::tools::render_ui::RenderUi;
 use crate::types::{AppConfig, McpServerProvenance, ToolResult};
 
 pub(crate) const MCP_LIST_SOURCES: &str = "mcp_list_sources";
 pub(crate) const MCP_SEARCH_TOOLS: &str = "mcp_search_tools";
 pub(crate) const MCP_GET_TOOL: &str = "mcp_get_tool";
 pub(crate) const MCP_CALL_TOOL: &str = "mcp_call_tool";
+
+const LOCAL_UI_SOURCE_ID: &str = "local_ui";
+const LOCAL_UI_TOOL_ID: &str = "render_html";
+const LOCAL_SHELL_SOURCE_ID: &str = "local_shell";
+const LOCAL_SHELL_TOOL_ID: &str = "exec";
 
 const DEFAULT_SOURCE_LIMIT: usize = 50;
 const MAX_SOURCE_LIMIT: usize = 100;
@@ -629,6 +638,153 @@ fn structured_json(value: Value) -> ToolResult {
     ToolResult::text(rendered).with_structured(value)
 }
 
+fn local_ui_source_summary() -> Value {
+    json!({
+        "id": LOCAL_UI_SOURCE_ID,
+        "name": LOCAL_UI_SOURCE_ID,
+        "provenance": "native",
+        "transport": "in-process",
+        "exposure": "catalog",
+        "toolCount": 1,
+        "implementation": {
+            "name": "codex-free-local-ui",
+            "version": "1.0.0"
+        },
+        "instructions": "Render trusted project-local self-contained HTML as an interactive MCP App inside ChatGPT."
+    })
+}
+
+fn local_ui_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Project-relative path to a trusted self-contained .html/.htm visualization."
+            },
+            "title": {
+                "type": "string",
+                "description": "Optional title shown above the interactive view."
+            },
+            "height": {
+                "type": "number",
+                "minimum": 260,
+                "maximum": 1000,
+                "description": "Preferred inline height in pixels. Default: 540."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
+fn local_ui_tool_metadata() -> Value {
+    json!({
+        "source": local_ui_source_summary(),
+        "tool": {
+            "id": LOCAL_UI_TOOL_ID,
+            "name": LOCAL_UI_TOOL_ID,
+            "title": "Legacy project UI payload adapter",
+            "description": "Legacy programmatic HTML-payload alias. To display a preview in ChatGPT, invoke the standalone render_ui tool with path/title/height; do not use mcp_call_tool for visible rendering. The generic dispatcher preserves payloads but intentionally does not attach a UI template.",
+            "inputSchema": local_ui_input_schema(),
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "_meta": serde_json::to_value(local_ui::tool_meta()).unwrap_or_else(|_| json!({}))
+        }
+    })
+}
+
+fn local_ui_query_matches(query: &str) -> bool {
+    let query_terms = tokenize(query);
+    if query_terms.is_empty() {
+        return true;
+    }
+    let searchable = tokenize(
+        "local ui render html interactive 3d model viewer webgl chart graph table dashboard diagram preview print slicer cad stl glb custom visualization",
+    )
+    .into_iter()
+    .collect::<HashSet<_>>();
+    query_terms.iter().any(|term| searchable.contains(term))
+}
+
+fn local_ui_search_match() -> Value {
+    json!({
+        "sourceId": LOCAL_UI_SOURCE_ID,
+        "sourceName": LOCAL_UI_SOURCE_ID,
+        "toolId": LOCAL_UI_TOOL_ID,
+        "toolName": LOCAL_UI_TOOL_ID,
+        "title": "Use standalone render_ui for a visible preview",
+        "description": "Call the standalone render_ui tool to display HTML/3D, images/SVG, JSON, CSV/TSV or source text. This local_ui/render_html catalog entry remains a legacy payload adapter; mcp_call_tool no longer attaches a preview widget.",
+        "score": 100.0
+    })
+}
+
+fn local_shell_source_summary() -> Value {
+    json!({
+        "id": LOCAL_SHELL_SOURCE_ID,
+        "name": LOCAL_SHELL_SOURCE_ID,
+        "provenance": "native",
+        "transport": "in-process",
+        "exposure": "catalog",
+        "toolCount": 1,
+        "implementation": {
+            "name": "codex-free-local-shell",
+            "version": "1.0.0"
+        },
+        "instructions": "Fallback local shell execution that does not depend on Codex App Server. Use for local recovery, diagnostics, service control, logs, builds, and other command-line tasks."
+    })
+}
+
+fn local_shell_tool_metadata() -> Value {
+    let exec = ExecCommand;
+    json!({
+        "source": local_shell_source_summary(),
+        "tool": {
+            "id": LOCAL_SHELL_TOOL_ID,
+            "name": LOCAL_SHELL_TOOL_ID,
+            "title": "Fallback local shell",
+            "description": "Run a shell command directly in codex-free without depending on Codex App Server. Intended as a general local execution and recovery path.",
+            "inputSchema": exec.input_schema(),
+            "outputSchema": exec.output_schema(),
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        }
+    })
+}
+
+fn local_shell_query_matches(query: &str) -> bool {
+    let query_terms = tokenize(query);
+    if query_terms.is_empty() {
+        return true;
+    }
+    let searchable = tokenize(
+        "local shell bash zsh command terminal exec execute cli recovery rescue restart launchctl service logs tail codesign curl lsof ps build test",
+    )
+    .into_iter()
+    .collect::<HashSet<_>>();
+    query_terms.iter().any(|term| searchable.contains(term))
+}
+
+fn local_shell_search_match() -> Value {
+    json!({
+        "sourceId": LOCAL_SHELL_SOURCE_ID,
+        "sourceName": LOCAL_SHELL_SOURCE_ID,
+        "toolId": LOCAL_SHELL_TOOL_ID,
+        "toolName": LOCAL_SHELL_TOOL_ID,
+        "title": "Fallback local shell",
+        "description": "Run shell commands directly in codex-free without Codex App Server. General-purpose fallback for recovery, diagnostics, service control, logs, builds, and CLI work.",
+        "score": 100.0
+    })
+}
+
 fn read_only_annotations() -> ToolAnnotations {
     ToolAnnotations::new()
         .read_only(true)
@@ -707,7 +863,7 @@ impl Tool for McpListSourcesTool {
         let query = match args.get("query") {
             None | Some(Value::Null) => None,
             Some(Value::String(query)) => Some(query.as_str()),
-            Some(_) => return ToolResult::error("`query` must be a string"),
+            Some(_) => return ToolResult::error("query must be a string"),
         };
         let limit = match parse_limit(&args, DEFAULT_SOURCE_LIMIT, MAX_SOURCE_LIMIT) {
             Ok(limit) => limit,
@@ -796,8 +952,71 @@ impl Tool for McpSearchToolsTool {
             Ok(limit) => limit,
             Err(error) => return ToolResult::error(error),
         };
-        match self.catalog.search(query, source, limit) {
-            Ok(value) => structured_json(value),
+        if source == Some(LOCAL_UI_SOURCE_ID) {
+            let matches = if local_ui_query_matches(query) {
+                vec![local_ui_search_match()]
+            } else {
+                Vec::new()
+            };
+            let total = matches.len();
+            return structured_json(json!({
+                "query": query,
+                "source": LOCAL_UI_SOURCE_ID,
+                "matches": matches,
+                "total": total,
+            }));
+        }
+
+        if source == Some(LOCAL_SHELL_SOURCE_ID) {
+            let matches = if local_shell_query_matches(query) {
+                vec![local_shell_search_match()]
+            } else {
+                Vec::new()
+            };
+            let total = matches.len();
+            return structured_json(json!({
+                "query": query,
+                "source": LOCAL_SHELL_SOURCE_ID,
+                "matches": matches,
+                "total": total,
+            }));
+        }
+
+        match self.catalog.search(query, source, MAX_SEARCH_LIMIT) {
+            Ok(mut value) => {
+                if source.is_none() {
+                    let mut synthetic = Vec::new();
+                    if local_shell_query_matches(query) {
+                        synthetic.push(local_shell_search_match());
+                    }
+                    if local_ui_query_matches(query) {
+                        synthetic.push(local_ui_search_match());
+                    }
+                    if let Some(object) = value.as_object_mut() {
+                        let original_total =
+                            object.get("total").and_then(Value::as_u64).unwrap_or(0);
+                        if let Some(matches) =
+                            object.get_mut("matches").and_then(Value::as_array_mut)
+                        {
+                            for item in synthetic.iter().rev() {
+                                matches.insert(0, item.clone());
+                            }
+                            matches.truncate(limit);
+                        }
+                        object.insert(
+                            "total".into(),
+                            json!(original_total + synthetic.len() as u64),
+                        );
+                    }
+                } else if let Some(matches) = value
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("matches"))
+                    .and_then(Value::as_array_mut)
+                {
+                    matches.truncate(limit);
+                }
+                structured_json(value)
+            }
             Err(error) => ToolResult::error(error),
         }
     }
@@ -870,6 +1089,24 @@ impl Tool for McpGetToolTool {
             Ok(tool) => tool,
             Err(error) => return ToolResult::error(error),
         };
+        if source_id == LOCAL_UI_SOURCE_ID {
+            if tool_id == LOCAL_UI_TOOL_ID {
+                return structured_json(local_ui_tool_metadata());
+            }
+            return ToolResult::error(format!(
+                "Unknown tool id '{tool_id}' for MCP source '{LOCAL_UI_SOURCE_ID}'. Search with mcp_search_tools first."
+            ));
+        }
+
+        if source_id == LOCAL_SHELL_SOURCE_ID {
+            if tool_id == LOCAL_SHELL_TOOL_ID {
+                return structured_json(local_shell_tool_metadata());
+            }
+            return ToolResult::error(format!(
+                "Unknown tool id '{tool_id}' for MCP source '{LOCAL_SHELL_SOURCE_ID}'. Search with mcp_search_tools first."
+            ));
+        }
+
         let source = match self.catalog.source(source_id) {
             Ok(source) => source,
             Err(error) => return ToolResult::error(error),
@@ -887,7 +1124,13 @@ struct McpCallToolTool {
 }
 
 impl McpCallToolTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        config: &AppConfig,
+        session: &SessionState,
+        cancellation: Option<&CancellationToken>,
+    ) -> ToolResult {
         let source_id = match required_string(&args, "source") {
             Ok(source) => source,
             Err(error) => return ToolResult::error(error),
@@ -896,6 +1139,43 @@ impl McpCallToolTool {
             Ok(tool) => tool,
             Err(error) => return ToolResult::error(error),
         };
+        if source_id == LOCAL_UI_SOURCE_ID {
+            if tool_id != LOCAL_UI_TOOL_ID {
+                return ToolResult::error(format!(
+                    "Unknown tool id '{tool_id}' for MCP source '{LOCAL_UI_SOURCE_ID}'. Search with mcp_search_tools first."
+                ));
+            }
+            let ui_args = match args.get("arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(Value::Object(arguments)) => Value::Object(arguments.clone()),
+                Some(_) => {
+                    return ToolResult::error(
+                        "arguments must be a JSON object mapping the selected tool's parameter names to values",
+                    );
+                }
+            };
+            return RenderUi::render_from_args(ui_args, config).await;
+        }
+
+        if source_id == LOCAL_SHELL_SOURCE_ID {
+            if tool_id != LOCAL_SHELL_TOOL_ID {
+                return ToolResult::error(format!(
+                    "Unknown tool id '{tool_id}' for MCP source '{LOCAL_SHELL_SOURCE_ID}'. Search with mcp_search_tools first."
+                ));
+            }
+            let shell_args = match args.get("arguments") {
+                None | Some(Value::Null) => json!({}),
+                Some(Value::Object(arguments)) => Value::Object(arguments.clone()),
+                Some(_) => {
+                    return ToolResult::error(
+                        "arguments must be a JSON object mapping the selected tool's parameter names to values",
+                    );
+                }
+            };
+            let exec = ExecCommand;
+            return exec.call(shell_args, config, session).await;
+        }
+
         let source = match self.catalog.source(source_id) {
             Ok(source) => source,
             Err(error) => return ToolResult::error(error),
@@ -942,6 +1222,12 @@ impl Tool for McpCallToolTool {
         Some("Call a transitive MCP tool".to_string())
     }
 
+    fn meta(&self) -> Option<MetaObject> {
+        // Screenshots, text and errors must not acquire an unrelated HTML widget.
+        // Only the standalone render_ui tool attaches the local preview resource.
+        None
+    }
+
     fn description(&self) -> String {
         format!(
             "Invoke a catalog-mode upstream MCP tool selected by the model-visible source/tool ids returned by `{MCP_SEARCH_TOOLS}`. Call `{MCP_GET_TOOL}` first when exact arguments or upstream annotations matter. Results preserve upstream text, images, structured content, result metadata, and `isError`; configured timeouts and downstream cancellation are forwarded. Because this generic dispatcher can select tools with different side effects, its host-facing annotations are necessarily conservative and cannot reproduce per-tool approval semantics."
@@ -975,6 +1261,22 @@ impl Tool for McpCallToolTool {
     }
 
     fn call_identity(&self, args: &Value) -> ToolCallIdentity {
+        if args.get("source").and_then(Value::as_str) == Some(LOCAL_UI_SOURCE_ID) {
+            let tool = args
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            return ToolCallIdentity::mcp(self.name(), LOCAL_UI_SOURCE_ID.to_string(), tool);
+        }
+
+        if args.get("source").and_then(Value::as_str) == Some(LOCAL_SHELL_SOURCE_ID) {
+            let tool = args
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            return ToolCallIdentity::mcp(self.name(), LOCAL_SHELL_SOURCE_ID.to_string(), tool);
+        }
+
         let source = args
             .get("source")
             .and_then(Value::as_str)
@@ -1000,25 +1302,44 @@ impl Tool for McpCallToolTool {
         false
     }
 
-    async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+    fn execution_policy(&self, args: &Value) -> crate::tool::ToolExecutionPolicy {
+        let nested_args = args.get("arguments").unwrap_or(&Value::Null);
+        match (
+            args.get("source").and_then(Value::as_str),
+            args.get("tool").and_then(Value::as_str),
+        ) {
+            (Some(LOCAL_SHELL_SOURCE_ID), Some(LOCAL_SHELL_TOOL_ID)) => {
+                ExecCommand.execution_policy(nested_args)
+            }
+            (Some(LOCAL_UI_SOURCE_ID), Some(LOCAL_UI_TOOL_ID)) => {
+                RenderUi.execution_policy(nested_args)
+            }
+            _ => crate::tool::ToolExecutionPolicy {
+                requires_project_root: false,
+                uses_exec_session_state: false,
+                may_modify_project: false,
+            },
+        }
+    }
+
+    async fn call(&self, args: Value, config: &AppConfig, session: &SessionState) -> ToolResult {
+        self.run(args, config, session, None).await
     }
 
     async fn call_with_context(
         &self,
         args: Value,
-        _config: &AppConfig,
-        _session: &SessionState,
+        config: &AppConfig,
+        session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(args, config, session, Some(&context.cancellation))
+            .await
     }
 }
 
 pub(crate) fn build_catalog_tools(inputs: Vec<CatalogSourceInput>) -> Vec<Box<dyn Tool>> {
-    if inputs.is_empty() {
-        return Vec::new();
-    }
+    // Native local_shell must remain discoverable even if every upstream is down.
     let catalog = Arc::new(Catalog::new(inputs));
     let manifest = catalog.manifest_description();
     vec![
@@ -1044,6 +1365,59 @@ pub(crate) fn build_catalog_tools(inputs: Vec<CatalogSourceInput>) -> Vec<Box<dy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_dispatcher_does_not_attach_local_preview() {
+        let tool = McpCallToolTool {
+            catalog: Arc::new(Catalog::new(Vec::new())),
+        };
+        assert!(tool.meta().is_none());
+        assert!(!tool.fills_structured_content());
+        assert!(RenderUi.meta().is_some());
+    }
+
+    #[test]
+    fn local_shell_inherits_native_project_checkpoint_and_session_policy() {
+        let tool = McpCallToolTool {
+            catalog: Arc::new(Catalog::new(Vec::new())),
+        };
+        let policy = tool.execution_policy(&json!({"source":"local_shell", "tool":"exec"}));
+        assert_eq!(policy, ExecCommand.execution_policy(&Value::Null));
+        assert!(
+            policy.requires_project_root
+                && policy.may_modify_project
+                && policy.uses_exec_session_state
+        );
+        let remote = tool.execution_policy(&json!({"source":"other", "tool":"exec"}));
+        assert!(
+            !remote.requires_project_root
+                && !remote.may_modify_project
+                && !remote.uses_exec_session_state
+        );
+        let invalid = tool.execution_policy(&json!({"source":"local_shell", "tool":"missing"}));
+        assert!(!invalid.uses_exec_session_state);
+        let ui = tool.execution_policy(&json!({"source":"local_ui", "tool":"render_html"}));
+        assert!(ui.requires_project_root && !ui.may_modify_project);
+    }
+
+    #[tokio::test]
+    async fn local_shell_is_discoverable_without_upstreams() {
+        let tools = build_catalog_tools(Vec::new());
+        let search = tools.iter().find(|t| t.name() == MCP_SEARCH_TOOLS).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config = crate::config::default_config(root.path().to_path_buf());
+        let result = search
+            .call(
+                json!({"query":"local_shell exec", "source":"local_shell"}),
+                &config,
+                &SessionState::new(),
+            )
+            .await;
+        assert!(!result.is_error);
+        let output = result.structured_content.unwrap();
+        assert_eq!(output["matches"][0]["sourceId"], "local_shell");
+        assert_eq!(output["matches"][0]["toolId"], "exec");
+    }
 
     #[test]
     fn tokenizer_splits_names_for_ranked_search() {

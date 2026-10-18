@@ -40,6 +40,7 @@ use crate::auth::{generate_internal_bearer_token, require_auth};
 use crate::conversation_auth::{AUTHORIZATION_TOOL_WIRE_NAME, ConversationAuthorizationStore};
 use crate::exec_sessions::{ConversationExecSessionStore, SessionState};
 use crate::instructions::build_initial_instructions;
+use crate::local_ui;
 use crate::openai_tunnel::TunnelHealth;
 use crate::output_budget::{
     enforce_tool_result_budget, fill_text_mirror_with_budget, tool_output_token_budget,
@@ -255,7 +256,7 @@ impl ServerHandler for CodexHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
         Ok(
-            ListResourcesResult::with_all_items(vec![review_ui::resource()])
+            ListResourcesResult::with_all_items(vec![review_ui::resource(), local_ui::resource()])
                 .with_ttl_ms(0)
                 .with_cache_scope(CacheScope::Private),
         )
@@ -288,7 +289,9 @@ impl ServerHandler for CodexHandler {
                 None,
             ));
         }
-        let Some(contents) = review_ui::contents_for_uri(&request.uri) else {
+        let contents = review_ui::contents_for_uri(&request.uri)
+            .or_else(|| local_ui::contents_for_uri(&request.uri));
+        let Some(contents) = contents else {
             return Err(McpError::resource_not_found(
                 format!("Unknown resource: {}", request.uri),
                 None,
@@ -325,6 +328,7 @@ impl ServerHandler for CodexHandler {
         // Keep `tool` as an Option so that even an unknown-tool call flows through
         // the audit begin/finish pairing below rather than short-circuiting.
         let tool = self.tools.iter().find(|t| t.name() == name);
+        let execution_policy = tool.map(|tool| tool.execution_policy(&args));
         let call_identity = tool
             .map(|tool| tool.call_identity(&args))
             .unwrap_or_else(|| ToolCallIdentity::native(name.clone()));
@@ -388,14 +392,15 @@ impl ServerHandler for CodexHandler {
         } else {
             // A ChatGPT conversation gets its own exec-session view (#12); generic MCP
             // clients fall back to the transport-owned session.
-            let conversation_exec_session = if tool.is_some_and(|t| t.uses_exec_session_state()) {
-                conversation.as_ref().map(|identity| {
-                    self.conversation_exec_sessions
-                        .session_for(identity, &self.session)
-                })
-            } else {
-                None
-            };
+            let conversation_exec_session =
+                if execution_policy.is_some_and(|p| p.uses_exec_session_state) {
+                    conversation.as_ref().map(|identity| {
+                        self.conversation_exec_sessions
+                            .session_for(identity, &self.session)
+                    })
+                } else {
+                    None
+                };
             let session = conversation_exec_session.as_ref().unwrap_or(&self.session);
 
             match tool {
@@ -413,7 +418,7 @@ impl ServerHandler for CodexHandler {
                             .await
                     }
                 }
-                Some(tool) if tool.requires_project_root() => {
+                Some(tool) if execution_policy.is_some_and(|p| p.requires_project_root) => {
                     let resolved = match conversation.as_ref() {
                         Some(identity) => self
                             .project_bindings
@@ -427,7 +432,7 @@ impl ServerHandler for CodexHandler {
                                 Some(identity) => ReviewOwner::conversation(identity),
                                 None => ReviewOwner::transport(self.session.review_state()),
                             };
-                            if tool.may_modify_project() {
+                            if execution_policy.is_some_and(|p| p.may_modify_project) {
                                 // Fail closed: refuse a mutating tool when the review
                                 // checkpoint cannot be captured. The refusal is returned
                                 // as a value (not an early return) so the audit
@@ -1198,6 +1203,152 @@ mod tests {
             next_tool_call_id: Arc::new(AtomicU64::new(1)),
             session: SessionState::new(),
         }
+    }
+
+    fn fallback_test_request(
+        name: &str,
+        conversation: &str,
+        arguments: Value,
+    ) -> CallToolRequestParams {
+        let mut request = CallToolRequestParams::new(name.to_string())
+            .with_arguments(arguments.as_object().unwrap().clone());
+        request.meta =
+            Some(serde_json::from_value(json!({"openai/session": conversation})).unwrap());
+        request
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_shell_follows_project_and_resumes_after_reconnect() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut tools = crate::registry::load_tools_for_mode(true);
+        tools.extend(crate::mcp_catalog::build_catalog_tools(Vec::new()));
+        let mut handler = handler_with_tools(root.path(), tools, crate::types::ToolLogLevel::Info);
+        let config = Arc::make_mut(&mut handler.config);
+        config.multi_project = true;
+        config.worktrees.mode = crate::types::WorktreeMode::Never;
+        config.skills.enabled = Some(false);
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let first = CodexHandler {
+            config: handler.config.clone(),
+            tools: handler.tools.clone(),
+            project_bindings: handler.project_bindings.clone(),
+            conversation_authorizations: handler.conversation_authorizations.clone(),
+            conversation_exec_sessions: handler.conversation_exec_sessions.clone(),
+            review_checkpoints: handler.review_checkpoints.clone(),
+            artifact_egress: handler.artifact_egress.clone(),
+            audit: handler.audit.clone(),
+            tool_logging: handler.tool_logging.clone(),
+            next_tool_call_id: handler.next_tool_call_id.clone(),
+            session: SessionState::new(),
+        };
+        let server =
+            tokio::spawn(async move { first.serve(server_io).await.unwrap().waiting().await });
+        let client = ().serve(client_io).await.unwrap();
+        let args = json!({"source":"local_shell", "tool":"exec", "arguments":{"cmd":"pwd", "yield_time_ms":1000}});
+        let unbound = client
+            .call_tool(fallback_test_request(
+                "mcp_call_tool",
+                "fallback-owner",
+                args.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unbound.is_error, Some(true));
+        assert!(
+            unbound.content[0]
+                .as_text()
+                .unwrap()
+                .text
+                .contains("set_project_root")
+        );
+        let bound = client
+            .call_tool(fallback_test_request(
+                "set_project_root",
+                "fallback-owner",
+                json!({"path":"project"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bound.is_error, Some(false));
+        let pwd = client
+            .call_tool(fallback_test_request(
+                "mcp_call_tool",
+                "fallback-owner",
+                args,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pwd.is_error, Some(false));
+        assert_eq!(
+            pwd.structured_content.as_ref().unwrap()["output"]
+                .as_str()
+                .unwrap()
+                .trim(),
+            project.canonicalize().unwrap().to_str().unwrap()
+        );
+        let started = client.call_tool(fallback_test_request("mcp_call_tool", "fallback-owner", json!({
+            "source":"local_shell", "tool":"exec", "arguments":{"cmd":"cat", "yield_time_ms":250}
+        }))).await.unwrap();
+        assert_eq!(started.is_error, Some(false));
+        let id = started.structured_content.as_ref().unwrap()["session_id"]
+            .as_u64()
+            .unwrap();
+        client.cancel().await.unwrap();
+        server.await.unwrap().unwrap();
+
+        handler.session = SessionState::new();
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let server =
+            tokio::spawn(async move { handler.serve(server_io).await.unwrap().waiting().await });
+        let client = ().serve(client_io).await.unwrap();
+        let other = client
+            .call_tool(fallback_test_request(
+                "set_project_root",
+                "fallback-other",
+                json!({"path":"project"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(other.is_error, Some(false));
+        let denied = client
+            .call_tool(fallback_test_request(
+                "write_stdin",
+                "fallback-other",
+                json!({"session_id":id, "chars":"wrong\n", "yield_time_ms":250}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.is_error, Some(true));
+        let resumed = client
+            .call_tool(fallback_test_request(
+                "write_stdin",
+                "fallback-owner",
+                json!({"session_id":id, "chars":"FALLBACK_RESUME_OK\n", "yield_time_ms":250}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resumed.is_error, Some(false));
+        assert!(
+            resumed.structured_content.as_ref().unwrap()["output"]
+                .as_str()
+                .unwrap()
+                .contains("FALLBACK_RESUME_OK")
+        );
+        let stopped = client
+            .call_tool(fallback_test_request(
+                "write_stdin",
+                "fallback-owner",
+                json!({"session_id":id, "chars":"\u{0003}", "yield_time_ms":1000}),
+            ))
+            .await
+            .unwrap();
+        // Ctrl-C terminates the process with a nonzero exit status by design.
+        assert!(stopped.structured_content.as_ref().unwrap()["exit_code"].is_number());
+        client.cancel().await.unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[test]

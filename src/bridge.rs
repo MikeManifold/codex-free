@@ -921,6 +921,14 @@ async fn connect_one_with_env(
                         .to_string(),
                 );
             }
+            if spec.shared_codex_oauth
+                && (bearer_token.is_some() || configures_authorization_header(spec))
+            {
+                return Err(
+                    "shared Codex OAuth cannot be combined with another Authorization source"
+                        .to_string(),
+                );
+            }
             let headers = build_http_headers(spec, env_lookup);
 
             let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url);
@@ -928,19 +936,38 @@ async fn connect_one_with_env(
                 transport_config = transport_config.auth_header(token);
             }
             transport_config = transport_config.custom_headers(headers);
-            let transport = StreamableHttpClientTransport::with_client(
-                build_upstream_client()?,
-                transport_config,
-            );
-            let connect = async {
-                let service = ().serve(transport).await.map_err(|error| error.to_string())?;
-                let tools = service
-                    .list_all_tools()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok::<_, String>((service, tools))
-            };
-            tokio::time::timeout(startup_timeout, connect).await
+            if spec.shared_codex_oauth {
+                let client = crate::shared_oauth::SharedOAuthClient::new(
+                    build_upstream_client()?,
+                    server_name,
+                    url,
+                );
+                let transport =
+                    StreamableHttpClientTransport::with_client(client, transport_config);
+                let connect = async {
+                    let service = ().serve(transport).await.map_err(|error| error.to_string())?;
+                    let tools = service
+                        .list_all_tools()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((service, tools))
+                };
+                tokio::time::timeout(startup_timeout, connect).await
+            } else {
+                let transport = StreamableHttpClientTransport::with_client(
+                    build_upstream_client()?,
+                    transport_config,
+                );
+                let connect = async {
+                    let service = ().serve(transport).await.map_err(|error| error.to_string())?;
+                    let tools = service
+                        .list_all_tools()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((service, tools))
+                };
+                tokio::time::timeout(startup_timeout, connect).await
+            }
         }
     };
 
@@ -1845,11 +1872,18 @@ mod tests {
         );
 
         let bridge = connect_upstreams(&config).await;
-        assert_eq!(bridge.tools.len(), 71);
-        assert!(bridge.tools.iter().all(|tool| !matches!(
-            tool.name(),
-            MCP_LIST_SOURCES | MCP_SEARCH_TOOLS | MCP_GET_TOOL | MCP_CALL_TOOL
-        )));
+        assert_eq!(bridge.tools.len(), 75);
+        assert_eq!(
+            bridge
+                .tools
+                .iter()
+                .filter(|tool| matches!(
+                    tool.name(),
+                    MCP_LIST_SOURCES | MCP_SEARCH_TOOLS | MCP_GET_TOOL | MCP_CALL_TOOL
+                ))
+                .count(),
+            4
+        );
         let names = bridge
             .tools
             .iter()
@@ -1925,8 +1959,8 @@ mod tests {
         );
 
         let bridge = connect_upstreams(&config).await;
-        assert_eq!(bridge.tools.len(), 1);
-        assert_eq!(bridge.tools[0].name(), "IDA_MCP_");
+        assert_eq!(bridge.tools.len(), 5);
+        assert!(bridge.tools.iter().any(|tool| tool.name() == "IDA_MCP_"));
         assert!(generated.path().join("IDA MCP!").join("SKILL.md").is_file());
         let identity = bridge_tool(&bridge, "IDA_MCP_").call_identity(&json!({
             "function": "rename-function",
@@ -2182,9 +2216,10 @@ mod tests {
             },
         );
         let bridge = connect_upstreams(&config).await;
-        assert!(
-            bridge.tools.is_empty(),
-            "a failing upstream must be skipped, not fatal"
+        assert_eq!(
+            bridge.tools.len(),
+            4,
+            "native fallback tools must survive upstream failure"
         );
         assert!(bridge.services.is_empty());
         // The failure is surfaced in the report, not swallowed.
@@ -2203,7 +2238,7 @@ mod tests {
             },
         );
         let bridge = connect_upstreams(&config).await;
-        assert!(bridge.tools.is_empty());
+        assert_eq!(bridge.tools.len(), 4);
         assert!(
             bridge.report.iter().any(|l| l.contains("not supported")),
             "sse transport should be reported as unsupported: {:?}",
@@ -2223,7 +2258,7 @@ mod tests {
             },
         );
         let bridge = connect_upstreams(&config).await;
-        assert!(bridge.tools.is_empty());
+        assert_eq!(bridge.tools.len(), 4);
     }
 
     #[test]

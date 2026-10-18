@@ -66,6 +66,7 @@ fn load_tools_with_options(
     }
     all.extend([
         Box::new(tools::run_command::RunCommand),
+        Box::new(tools::render_ui::RenderUi),
         Box::new(tools::git_status::GitStatus),
         Box::new(tools::show_changes::ShowChanges),
         Box::new(tools::git_push::GitPush),
@@ -96,7 +97,7 @@ fn load_tools_with_options(
         // Codex's skills.list / skills.read.
         Box::new(tools::skills_list::SkillsList),
         Box::new(tools::skills_read::SkillsRead),
-    ] as [Box<dyn Tool>; 24]);
+    ] as [Box<dyn Tool>; 25]);
 
     let mut seen = std::collections::HashSet::new();
     for tool in &all {

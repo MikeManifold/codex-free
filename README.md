@@ -1,5 +1,7 @@
 # Codex-free (rewritten to Rust)
 
+> **Mac mini 本机维护**：运行与更新、持久签名、权限检查统一从 [维护入口](docs/maintenance/README.md) 进入；[仓库分层规则](AGENTS.md) · [文档索引](docs/README.md) · [2026-10-18 验收记录](docs/maintenance/records/2026-10-18-local-signing/README.md)。相关实现、测试和记录均在本仓库维护。
+
 *Codex Free, rewritten in Rust (but you still have to buy ChatGPT Plus)*
 
 > 📖 **New here? Start with the [Wiki](https://github.com/hypnguyen1209/codex-free/wiki)** — an end-user guide covering [installation](https://github.com/hypnguyen1209/codex-free/wiki/Installation), [every CLI argument](https://github.com/hypnguyen1209/codex-free/wiki/CLI-Reference), [every config option](https://github.com/hypnguyen1209/codex-free/wiki/Configuration), and [how it all works end-to-end](https://github.com/hypnguyen1209/codex-free/wiki/How-It-Works). This README is the complete technical reference; the wiki is the friendlier path in.
@@ -754,6 +756,7 @@ The `codexMcp` block controls [automatic import of MCP servers configured in Cod
 | `enabled` | `true` | Import Codex MCP servers (direct `config.toml` parsing plus CLI discovery); `false` disables only MCP-server import — project catalogue discovery is unaffected — unless the explicit `--codex-cli` requirement overrides it |
 | `useCli` | `true` | Enrich direct config parsing with `codex mcp list/get --json`, which includes MCP servers contributed by enabled Codex plugins. `false` keeps direct `config.toml` parsing but does not invoke Codex |
 | `cliPath` | `CODEX_CLI_PATH`, then `codex` on `PATH` | Codex executable used for CLI enrichment. Relative paths resolve from the directory where Codex Free was launched |
+| `shareOAuthFile` | `false` | For HTTP servers directly imported from Codex `config.toml`, read a matching access token from Codex's file-backed MCP OAuth store before each request. Does not import plugin-only MCP servers or write/refresh credentials. |
 
 The `projectCatalog` block controls project discovery in [multi-project mode](#multi-project-mode). It is independent from `codexMcp`: disabling imported MCP servers does not disable native project discovery, and vice versa.
 
@@ -1281,7 +1284,7 @@ When `remote-exec` was imported from Codex, that overlay is sufficient; include 
 - `type` is inferred: `command` means `"stdio"`, while `url` means Streamable HTTP. Explicit HTTP aliases `"http"`, `"streamable-http"`, and `"streamable_http"` are accepted.
 - Legacy SSE and WebSocket transports are rejected explicitly because current Codex supports stdio and Streamable HTTP, not those legacy protocols.
 
-OAuth authorization-code login and credential persistence are not implemented by this bridge. An OAuth-protected upstream must therefore be supplied a usable bearer token through `bearerTokenEnvVar` or an environment-backed `Authorization` header. Upstream MCP resources, resource templates, and prompts remain separate capability work: Codex Free's native exported-file resources are resolved locally, but resource links returned by a bridged server are not proxied through that server. Catalog mode reports upstream initialization instructions as source metadata, but does not inject them into Codex Free's own initialization instructions.
+OAuth authorization-code login and credential refresh are not implemented by this bridge. Set `"codexMcp": {"shareOAuthFile": true}` to reuse **valid** access tokens that Codex already saved in `CODEX_HOME/.credentials.json` (or `~/.codex/.credentials.json`). The bridge matches both server name and URL, reads under Codex's aggregate-store lock, rejects insecure credential-file permissions and expired tokens, and never writes the store or uses refresh tokens. Codex must authorize and refresh the source; the next bridge HTTP request picks up its new access token without a restart. Public HTTP servers without a matching credential remain unauthenticated. Servers with `bearerTokenEnvVar` or an `Authorization` header continue using their configured authentication instead. Explicit `mcpServers` entries can opt in individually with `sharedCodexOAuth: true`, but may not combine it with other Authorization sources. Upstream MCP resources, resource templates, and prompts remain separate capability work: Codex Free's native exported-file resources are resolved locally, but resource links returned by a bridged server are not proxied through that server. Catalog mode reports upstream initialization instructions as source metadata, but does not inject them into Codex Free's own initialization instructions.
 
 If your server doesn't show up, **check the banner first** — the most common cause is a wrong `command` path.
 

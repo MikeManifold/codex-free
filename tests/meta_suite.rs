@@ -25,15 +25,15 @@ use codex_free::types::{AppConfig, ToolContent, ToolResult};
 // ─── registry.test.ts ──────────────────────────────────────────────────
 
 #[test]
-fn loads_all_28_tools() {
+fn loads_all_29_tools() {
     let tools = load_tools();
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 29);
 }
 
 #[test]
 fn multi_project_mode_adds_catalogue_and_session_selector() {
     let tools = load_tools_for_mode(true);
-    assert_eq!(tools.len(), 30);
+    assert_eq!(tools.len(), 31);
     assert_eq!(tools[0].name(), "list_projects");
     assert_eq!(tools[1].name(), "set_project_root");
 }
@@ -46,7 +46,7 @@ fn artifact_ingress_can_be_omitted_by_configuration() {
         .into_iter()
         .map(|tool| tool.name())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 27);
+    assert_eq!(names.len(), 28);
     assert!(!names.contains(&"import_host_file"));
 }
 
@@ -58,7 +58,7 @@ fn artifact_egress_can_be_omitted_by_configuration() {
         .into_iter()
         .map(|tool| tool.name())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 27);
+    assert_eq!(names.len(), 28);
     assert!(!names.contains(&"export_host_file"));
 }
 
@@ -68,7 +68,7 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
     config.conversation_auth_token =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
     let tools = load_tools_for_config(&config);
-    assert_eq!(tools.len(), 29);
+    assert_eq!(tools.len(), 30);
     assert_eq!(tools[0].name(), "setup");
     let schema = tools[0].input_schema();
     assert!(schema["properties"].get("ref").is_some());
@@ -91,7 +91,7 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
 
     config.multi_project = true;
     let tools = load_tools_for_config(&config);
-    assert_eq!(tools.len(), 31);
+    assert_eq!(tools.len(), 32);
     assert_eq!(tools[0].name(), "setup");
     assert_eq!(tools[1].name(), "list_projects");
     assert_eq!(tools[2].name(), "set_project_root");
@@ -135,6 +135,7 @@ fn includes_expected_tool_names() {
         "import_host_file",
         "export_host_file",
         "run_command",
+        "render_ui",
         "git_status",
         "show_changes",
         "git_push",

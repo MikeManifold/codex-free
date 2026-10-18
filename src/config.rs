@@ -326,6 +326,7 @@ struct CodexMcpConfig {
     enabled: Option<bool>,
     use_cli: Option<bool>,
     cli_path: Option<String>,
+    share_oauth_file: Option<bool>,
 }
 
 impl CodexMcpConfig {
@@ -375,6 +376,7 @@ struct PartialMcpServerSpec {
     bearer_token_env_var: Option<String>,
     http_headers: Option<HashMap<String, String>>,
     env_http_headers: Option<HashMap<String, String>>,
+    shared_codex_oauth: Option<bool>,
     startup_timeout_sec: Option<f64>,
     tool_timeout_sec: Option<f64>,
     tools: Option<Vec<String>>,
@@ -395,6 +397,7 @@ impl PartialMcpServerSpec {
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            shared_codex_oauth,
             startup_timeout_sec,
             tool_timeout_sec,
             tools,
@@ -440,6 +443,9 @@ impl PartialMcpServerSpec {
         }
         if let Some(env_http_headers) = env_http_headers {
             base.env_http_headers = env_http_headers;
+        }
+        if let Some(shared_codex_oauth) = shared_codex_oauth {
+            base.shared_codex_oauth = shared_codex_oauth;
         }
         if let Some(startup_timeout_sec) = startup_timeout_sec {
             base.startup_timeout_sec = Some(startup_timeout_sec);
@@ -683,6 +689,22 @@ fn resolve_mcp_servers_from(
         }
     }
 
+    if settings.share_oauth_file.unwrap_or(false) {
+        for spec in imported.servers.values_mut() {
+            let custom_authorization = spec
+                .http_headers
+                .keys()
+                .chain(spec.env_http_headers.keys())
+                .any(|name| name.eq_ignore_ascii_case("authorization"));
+            if spec.provenance == crate::types::McpServerProvenance::CodexConfig
+                && spec.url.is_some()
+                && spec.bearer_token_env_var.is_none()
+                && !custom_authorization
+            {
+                spec.shared_codex_oauth = true;
+            }
+        }
+    }
     let (servers, overlay_report) = merge_mcp_servers(imported.servers, explicit);
     print_discovery_report("Codex MCP overrides:", &overlay_report);
     Ok(servers)
@@ -1478,6 +1500,7 @@ mod tests {
             bearer_token_env_var: None,
             http_headers: HashMap::new(),
             env_http_headers: HashMap::new(),
+            shared_codex_oauth: false,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
             tools: Some(vec!["read".to_string()]),
@@ -1485,6 +1508,41 @@ mod tests {
             mode: None,
             provenance: crate::types::McpServerProvenance::CodexConfig,
         }
+    }
+
+    #[test]
+    fn shared_oauth_opt_in_applies_only_to_imported_http_without_explicit_auth() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_config = root.path().join("config.toml");
+        std::fs::write(
+            &codex_config,
+            concat!(
+                "[mcp_servers.remote]\nurl = \"https://example.test/mcp\"\n",
+                "[mcp_servers.static]\nurl = \"https://static.test/mcp\"\n",
+                "bearer_token_env_var = \"STATIC_TOKEN\"\n",
+                "[mcp_servers.local]\ncommand = \"server\"\n",
+            ),
+        )
+        .unwrap();
+        let mut file = FileConfig {
+            codex_mcp: Some(CodexMcpConfig {
+                enabled: Some(true),
+                use_cli: Some(false),
+                cli_path: None,
+                share_oauth_file: Some(true),
+            }),
+            ..Default::default()
+        };
+        let servers = resolve_mcp_servers_from(
+            &mut file,
+            &cli(root.path(), &root.path().join("codex.config.json")),
+            Ok(codex_config),
+            None,
+        )
+        .unwrap();
+        assert!(servers["remote"].shared_codex_oauth);
+        assert!(!servers["static"].shared_codex_oauth);
+        assert!(!servers["local"].shared_codex_oauth);
     }
 
     fn cli(work_dir: &Path, config: &Path) -> Cli {
@@ -2160,6 +2218,7 @@ mod tests {
                 enabled: Some(true),
                 use_cli: Some(true),
                 cli_path: None,
+                share_oauth_file: None,
             }),
             ..Default::default()
         };
@@ -2182,6 +2241,7 @@ mod tests {
                 enabled: Some(false),
                 use_cli: Some(false),
                 cli_path: None,
+                share_oauth_file: None,
             }),
             ..Default::default()
         };
@@ -2212,6 +2272,7 @@ mod tests {
                 enabled: Some(true),
                 use_cli: Some(false),
                 cli_path: None,
+                share_oauth_file: None,
             }),
             ..Default::default()
         };
