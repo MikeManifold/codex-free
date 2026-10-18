@@ -375,10 +375,21 @@ pub async fn connect_upstreams(config: &AppConfig) -> Bridge {
     let mut names: Vec<&String> = config.mcp_servers.keys().collect();
     names.sort();
 
+    let ui_via_app_server = config
+        .mcp_servers
+        .values()
+        .any(|spec| !spec.disabled && spec.transport.as_deref() == Some("codex-app-server"));
+
     for server_name in names {
         let spec = &config.mcp_servers[server_name];
         if spec.disabled {
             report.push(format!("{server_name} -> disabled"));
+            continue;
+        }
+        if ui_via_app_server && ["cua_repl", "node_repl"].contains(&server_name.as_str()) {
+            report.push(format!(
+                "{server_name} -> routed through App Server; duplicate direct runtime not started"
+            ));
             continue;
         }
         let sanitized = sanitize(server_name);

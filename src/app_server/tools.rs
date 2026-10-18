@@ -4,7 +4,7 @@ use base64::Engine;
 use serde_json::{Map, Value, json};
 
 use super::{
-    AppServerBridge, VERSION,
+    AppServerSession, VERSION,
     client::{Connection, RpcError},
     confirmations::text_result,
 };
@@ -36,7 +36,7 @@ const SAFE_RPC: &[&str] = &[
     "fs/readDirectory",
 ];
 
-impl AppServerBridge {
+impl AppServerSession {
     pub(super) async fn execute(&self, name: &str, args: &Value) -> Result<Value, RpcError> {
         let conn = self.rpc.ensure_ready().await?;
         match name {
@@ -164,9 +164,24 @@ impl AppServerBridge {
         metadata: bool,
     ) -> Result<Value, RpcError> {
         let scope = self.utility(conn).await?;
+        let is_repl = ["cua_repl", "node_repl"].contains(&server);
+        if is_repl && tool == "turn_ended" {
+            return Err(RpcError::message(
+                "Use codex_ui_session_end to release only this caller's session",
+            ));
+        }
+        if is_repl {
+            self.utility
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .repl_servers
+                .insert(server.into());
+        }
         let mut p =
             json!({"threadId":scope["threadId"],"server":server,"tool":tool,"arguments":args});
-        if metadata {
+        if metadata || is_repl {
             p["_meta"] = json!({"x-codex-turn-metadata":scope["metadata"]});
         }
         let value = self.request(conn, "mcpServer/tool/call", p).await?;
@@ -198,7 +213,7 @@ impl AppServerBridge {
         let context = utility.as_ref().filter(|u| u.generation == conn.generation);
         json!({"adapter":"rust","cli":self.settings.cli,"workDir":self.settings.work_dir,"appServerRunning":conn.is_alive(),"appServerPid":conn.pid,
             "utilityThreadId":context.map(|u|&u.thread_id),"utilitySessionId":context.map(|u|&u.session_id),"syntheticTurnId":context.map(|u|&u.turn_id),
-            "modelTurnsStartedByBridge":0,"stderrTail":conn.stderr.lock().unwrap().iter().rev().take(20).collect::<Vec<_>>()})
+            "modelTurnsStartedByBridge":0,"idleTimeoutMs":300000,"sessionIsolation":"caller-owned-process","stderrTail":conn.stderr.lock().unwrap().iter().rev().take(20).collect::<Vec<_>>()})
     }
     async fn apps(&self, conn: &Connection, name: &str, args: &Value) -> Result<Value, RpcError> {
         let read = name == "codex_apps_read";

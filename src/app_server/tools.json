@@ -1,5 +1,10 @@
 [
   {
+    "name": "codex_ui_session_end",
+    "description": "End only this caller's App Server and Computer Use session immediately. Releases browser/control claims and in-memory REPL variables, cancels this caller's pending operations, and stops its owned runtime. Other chats, desktop Codex, native Rust files/commands, and local_shell/exec are unaffected. Idempotent; a later new call creates fresh state. Otherwise the server reclaims this session after five idle minutes following the last completed call; running operations and pending confirmations are not idle. Do not replay a write or reuse stale browser handles after ending/expiration.",
+    "inputSchema": {"type":"object","properties":{},"additionalProperties":false}
+  },
+  {
     "name": "codex_confirmations_list",
     "description": "List only this caller's pending App Server confirmations. Show the actual form/message to the human. Never infer consent or repeat the original pending tool call.",
     "inputSchema": {

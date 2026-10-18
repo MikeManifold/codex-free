@@ -4,9 +4,10 @@ use std::path::PathBuf;
 #[test]
 fn published_tools_keep_legacy_names_and_add_live_schema_selection() {
     let tools = AppServerBridge::tools();
-    assert_eq!(tools.len(), 26);
+    assert_eq!(tools.len(), 27);
     // Public compatibility contract: upstream MCP tools are discovered separately.
     let expected = [
+        "codex_ui_session_end",
         "codex_app_status",
         "codex_exec",
         "codex_fs_read",
@@ -408,9 +409,10 @@ mod subprocess {
             .structured_content
             .unwrap();
         let cancellation = CancellationToken::new();
-        let p = CallToolRequestParams::new("codex_mcp_call").with_arguments(
+        let mut p = CallToolRequestParams::new("codex_mcp_call").with_arguments(
             serde_json::from_value(json!({"server":"fixture","tool":"must_not_execute"})).unwrap(),
         );
+        p.meta = Some(serde_json::from_value(json!({"codex-free/call-owner":"owner"})).unwrap());
         let request = f.adapter.call(p, Some(&cancellation));
         tokio::pin!(request);
         // The second request has entered the serialized queue while the form is open.
@@ -517,9 +519,10 @@ mod subprocess {
             }
             trigger.cancel();
         });
-        let p = CallToolRequestParams::new("codex_mcp_call").with_arguments(
+        let mut p = CallToolRequestParams::new("codex_mcp_call").with_arguments(
             serde_json::from_value(json!({"server":"fixture","tool":"stall"})).unwrap(),
         );
+        p.meta = Some(serde_json::from_value(json!({"codex-free/call-owner":"owner"})).unwrap());
         let result = f.adapter.call(p, Some(&cancel)).await;
         assert!(result.is_error);
         let status = f.call("codex_mcp_status", json!({}), "owner").await;
@@ -531,6 +534,59 @@ mod subprocess {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the installed official CLI and an existing private configuration"]
+    async fn installed_runtime_isolates_callers_and_preserves_other_session_on_end() {
+        let config =
+            std::env::var("CODEX_APP_SERVER_TEST_CONFIG").expect("private configuration required");
+        let app = default_config(std::env::current_dir().unwrap());
+        let spec = McpServerSpec {
+            app_server: Some(AppServerConfig {
+                config_file: Some(config),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let adapter = AppServerBridge::new(&spec, &app).unwrap();
+        let _guard = adapter.guard();
+        async fn owned(
+            adapter: &Arc<AppServerBridge>,
+            owner: &str,
+            tool: &str,
+            args: Value,
+        ) -> ToolResult {
+            let mut params = CallToolRequestParams::new(tool.to_string())
+                .with_arguments(args.as_object().unwrap().clone());
+            params.meta =
+                Some(serde_json::from_value(json!({"codex-free/call-owner":owner})).unwrap());
+            adapter.call(params, None).await
+        }
+        let a=owned(&adapter,"acceptance-a","codex_mcp_call",json!({"server":"node_repl","tool":"js","arguments":{"code":"var freeOwnerProbe = 'A'; nodeRepl.write({stored:true});"}})).await;
+        assert!(!a.is_error, "{}", a.joined_text());
+        let b=owned(&adapter,"acceptance-b","codex_mcp_call",json!({"server":"node_repl","tool":"js","arguments":{"code":"nodeRepl.write({isolated: typeof freeOwnerProbe === 'undefined'});"}})).await;
+        assert!(!b.is_error, "{}", b.joined_text());
+        assert!(b.joined_text().contains("isolated: true"));
+        let a=owned(&adapter,"acceptance-a","codex_mcp_call",json!({"server":"node_repl","tool":"js","arguments":{"code":"nodeRepl.write({sameOwner: freeOwnerProbe === 'A'});"}})).await;
+        assert!(!a.is_error, "{}", a.joined_text());
+        assert!(a.joined_text().contains("sameOwner: true"));
+        let ended = owned(&adapter, "acceptance-a", "codex_ui_session_end", json!({})).await;
+        assert!(!ended.is_error, "{}", ended.joined_text());
+        assert_eq!(ended.structured_content.unwrap()["warnings"], json!([]));
+        let b=owned(&adapter,"acceptance-b","codex_mcp_call",json!({"server":"node_repl","tool":"js","arguments":{"code":"nodeRepl.write({stillAlive:true});"}})).await;
+        assert!(!b.is_error, "{}", b.joined_text());
+        assert!(b.joined_text().contains("stillAlive: true"));
+        let a=owned(&adapter,"acceptance-a","codex_mcp_call",json!({"server":"node_repl","tool":"js","arguments":{"code":"nodeRepl.write({freshState: typeof freeOwnerProbe === 'undefined'});"}})).await;
+        assert!(!a.is_error, "{}", a.joined_text());
+        assert!(a.joined_text().contains("freshState: true"));
+        for owner in ["acceptance-a", "acceptance-b"] {
+            assert!(
+                !owned(&adapter, owner, "codex_ui_session_end", json!({}))
+                    .await
+                    .is_error
+            );
+        }
     }
 
     #[tokio::test]
@@ -570,8 +626,25 @@ mod subprocess {
                 ..Default::default()
             },
         );
+        for name in ["cua_repl", "node_repl"] {
+            app.mcp_servers.insert(
+                name.into(),
+                McpServerSpec {
+                    command: Some("duplicate-runtime-must-not-start".into()),
+                    ..Default::default()
+                },
+            );
+        }
         let bridged = crate::bridge::connect_upstreams(&app).await;
         assert!(bridged.services.is_empty());
+        assert_eq!(
+            bridged
+                .report
+                .iter()
+                .filter(|line| line.contains("duplicate direct runtime not started"))
+                .count(),
+            2
+        );
         assert_eq!(bridged.app_servers.len(), 1);
         let sources = bridged
             .tools
@@ -599,9 +672,215 @@ mod subprocess {
         assert!(!f.log.exists());
     }
 
+    #[tokio::test]
+    async fn multi_call_contexts_are_isolated_and_explicit_end_affects_only_owner() {
+        let f = Fixture::new();
+        let a = f.call("codex_cua_js", json!({"code":"a"}), "a").await;
+        let b = f.call("codex_cua_js", json!({"code":"b"}), "b").await;
+        assert!(!a.is_error && !b.is_error);
+        let before = f.requests();
+        let js = before
+            .iter()
+            .filter(|r| r["params"]["tool"] == "js")
+            .collect::<Vec<_>>();
+        assert_ne!(js[0]["params"]["threadId"], js[1]["params"]["threadId"]);
+        assert_ne!(js[0]["params"]["_meta"], js[1]["params"]["_meta"]);
+        let ended = f.call("codex_ui_session_end", json!({}), "a").await;
+        assert_eq!(ended.structured_content.unwrap()["ended"], true);
+        let twice = f.call("codex_ui_session_end", json!({}), "a").await;
+        assert_eq!(twice.structured_content.unwrap()["alreadyEnded"], true);
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"b again"}), "b")
+                .await
+                .is_error
+        );
+        let requests = f.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "thread/start")
+                .count(),
+            2
+        );
+        let end = requests
+            .iter()
+            .find(|r| r["params"]["tool"] == "turn_ended")
+            .unwrap();
+        assert_eq!(end["params"]["threadId"], js[0]["params"]["threadId"]);
+        assert_eq!(end["params"]["_meta"], js[0]["params"]["_meta"]);
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"new a"}), "a")
+                .await
+                .is_error
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_deadline_is_five_minutes_after_completion_and_is_renewed() {
+        let f = Fixture::new();
+        let started = tokio::time::Instant::now();
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"first"}), "a")
+                .await
+                .is_error
+        );
+        f.adapter
+            .reap_idle(started + lifecycle::IDLE_TIMEOUT, lifecycle::IDLE_TIMEOUT)
+            .await;
+        assert!(
+            !f.requests()
+                .iter()
+                .any(|r| r["params"]["tool"] == "turn_ended")
+        );
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"second"}), "a")
+                .await
+                .is_error
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "thread/start")
+                .count(),
+            1
+        );
+        f.adapter
+            .reap_idle(
+                tokio::time::Instant::now() + Duration::from_secs(301),
+                lifecycle::IDLE_TIMEOUT,
+            )
+            .await;
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["params"]["tool"] == "turn_ended")
+                .count(),
+            1
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "thread/unsubscribe")
+                .count(),
+            1
+        );
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"fresh"}), "a")
+                .await
+                .is_error
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "thread/start")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_confirmation_prevents_idle_reclaim_and_end_cancels_without_replay() {
+        let f = Fixture::new();
+        let pending = f
+            .call(
+                "codex_mcp_call",
+                json!({"server":"fixture","tool":"confirm"}),
+                "a",
+            )
+            .await;
+        let receipt = pending.structured_content.unwrap();
+        f.adapter
+            .reap_idle(
+                tokio::time::Instant::now() + Duration::from_secs(301),
+                lifecycle::IDLE_TIMEOUT,
+            )
+            .await;
+        assert!(
+            !f.requests()
+                .iter()
+                .any(|r| r["method"] == "thread/unsubscribe")
+        );
+        assert!(!f.call("codex_mcp_status", json!({}), "b").await.is_error);
+        assert!(
+            !f.call("codex_ui_session_end", json!({}), "a")
+                .await
+                .is_error
+        );
+        assert!(
+            f.call(
+                "codex_operation_result",
+                json!({"operationId":receipt["operationId"]}),
+                "a"
+            )
+            .await
+            .is_error
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["params"]["tool"] == "confirm")
+                .count(),
+            1
+        );
+        assert!(!f.call("codex_mcp_status", json!({}), "b").await.is_error);
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_is_bounded_by_stopping_only_owned_runtime() {
+        let f = Fixture::new();
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"use"}), "a")
+                .await
+                .is_error
+        );
+        f.configure(json!({"cleanupError":true}));
+        let ended = f.call("codex_ui_session_end", json!({}), "a").await;
+        assert!(!ended.is_error);
+        assert_eq!(
+            ended.structured_content.unwrap()["warnings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"fresh"}), "a")
+                .await
+                .is_error
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            2
+        );
+    }
+
     const FIXTURE: &str = r##"#!/usr/bin/env python3
 import sys,json,os,time,base64
-log=os.environ['FIXTURE_LOG'];modefile=os.environ['FIXTURE_MODE'];pending={};formid=10000
+log=os.environ['FIXTURE_LOG'];modefile=os.environ['FIXTURE_MODE'];pending={};formid=10000;threads=0
 def send(v):print(json.dumps(v),flush=True)
 def reply(i,v):send({'id':i,'result':v})
 def result(v):return {'content':[{'type':'text','text':json.dumps(v)}],'structuredContent':v}
@@ -619,13 +898,16 @@ for line in sys.stdin:
   reply(original,{'data':[]} if directory else result({'accepted':approved}));continue
  if i is None:continue
  if method=='initialize':reply(i,{})
- elif method=='thread/start':reply(i,{'thread':{'id':'fixture-thread','sessionId':'fixture-session'}})
+ elif method=='thread/start':
+  threads+=1;reply(i,{'thread':{'id':f'fixture-{os.getpid()}-{threads}','sessionId':f'session-{os.getpid()}'}})
+ elif method=='thread/unsubscribe':reply(i,{'status':'unsubscribed'})
  elif method=='mcpServerStatus/list':
   name=mode.get('toolName','first_tool')
   reply(i,{'data':[{'name':'cua_repl','tools':{'js':{'name':'js'}}},{'name':'fixture','tools':{name:{'name':name,'description':'Runtime-discovered fixture tool','inputSchema':{'type':'object','properties':{'live':{'type':'boolean'}}}}}},{'name':'codex_apps','tools':{'demo':{'name':'demo','_meta':{'connector_id':'fixture-app','connector_name':'Fixture App'}}}}]})
  elif method=='mcpServer/tool/call':
   tool=p.get('tool')
   if tool=='die':os._exit(17)
+  elif tool=='turn_ended' and mode.get('cleanupError'):send({'id':i,'error':{'code':-32000,'message':'Fixture cleanup failed'}})
   elif tool=='stall':time.sleep(20)
   elif tool in ['confirm','device']:form(i,'openai/userVerification' if tool=='device' else 'form')
   elif tool in ['capture','js']:reply(i,{'content':[{'type':'image','mimeType':'image/png','data':base64.b64encode(b'x'*90000).decode()}],'_meta':{'fixture':True},'isError':False})

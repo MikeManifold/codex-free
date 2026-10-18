@@ -126,6 +126,13 @@ impl Operations {
     pub fn set_active(&self, op: Option<&Arc<Operation>>) {
         *self.active.lock().unwrap() = op.map(Arc::downgrade);
     }
+    pub fn has_pending(&self) -> bool {
+        self.operations
+            .lock()
+            .unwrap()
+            .values()
+            .any(|op| op.state.lock().unwrap().status != "completed")
+    }
     pub fn request(&self, request: ServerRequest) -> bool {
         let op = self.active.lock().unwrap().as_ref().and_then(Weak::upgrade);
         let Some(op) = op else {

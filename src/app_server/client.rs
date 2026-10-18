@@ -134,6 +134,12 @@ impl Connection {
             }
         };
         self.pending.lock().unwrap().remove(&id);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.message.starts_with("App Server RPC timed out:"))
+        {
+            self.stop();
+        }
         result
     }
 }
@@ -181,10 +187,23 @@ impl RpcClient {
         *slot = Some(conn.clone());
         Ok(conn)
     }
-    pub async fn stop_owned(&self) {
+    pub async fn stop_owned(&self) -> bool {
         if let Some(conn) = self.connection.lock().await.as_ref() {
             conn.stop();
+            tokio::time::timeout(Duration::from_secs(5), conn.closed.cancelled())
+                .await
+                .is_ok()
+        } else {
+            true
         }
+    }
+    pub async fn current(&self) -> Option<Arc<Connection>> {
+        self.connection
+            .lock()
+            .await
+            .as_ref()
+            .filter(|c| c.is_alive())
+            .cloned()
     }
     async fn start(&self) -> Result<Arc<Connection>, RpcError> {
         let mut command = Command::new(&self.settings.cli);
