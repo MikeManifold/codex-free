@@ -1,6 +1,5 @@
 # Codex-free (rewritten to Rust)
 
-> **Mac mini 本机维护**：运行与更新、持久签名、权限检查统一从 [维护入口](docs/maintenance/README.md) 进入；[仓库分层规则](AGENTS.md) · [文档索引](docs/README.md) · [2026-10-18 验收记录](docs/maintenance/records/2026-10-18-local-signing/README.md)。相关实现、测试和记录均在本仓库维护。
 
 *Codex Free, rewritten in Rust (but you still have to buy ChatGPT Plus)*
 
@@ -756,7 +755,7 @@ The `codexMcp` block controls [automatic import of MCP servers configured in Cod
 | `enabled` | `true` | Import Codex MCP servers (direct `config.toml` parsing plus CLI discovery); `false` disables only MCP-server import — project catalogue discovery is unaffected — unless the explicit `--codex-cli` requirement overrides it |
 | `useCli` | `true` | Enrich direct config parsing with `codex mcp list/get --json`, which includes MCP servers contributed by enabled Codex plugins. `false` keeps direct `config.toml` parsing but does not invoke Codex |
 | `cliPath` | `CODEX_CLI_PATH`, then `codex` on `PATH` | Codex executable used for CLI enrichment. Relative paths resolve from the directory where Codex Free was launched |
-| `shareOAuthFile` | `false` | For HTTP servers directly imported from Codex `config.toml`, read a matching access token from Codex's file-backed MCP OAuth store before each request. Does not import plugin-only MCP servers or write/refresh credentials. |
+| `shareOauthFile` | `false` | For HTTP servers directly imported from Codex `config.toml`, read a matching access token from Codex's file-backed MCP OAuth store before each request. `shareOAuthFile` remains an accepted alias; do not specify both. Does not import plugin-only MCP servers or write/refresh credentials. |
 
 The `projectCatalog` block controls project discovery in [multi-project mode](#multi-project-mode). It is independent from `codexMcp`: disabling imported MCP servers does not disable native project discovery, and vice versa.
 
@@ -866,7 +865,7 @@ Each conversation binds a project exactly once, through the [`set_project_root`]
 - The binding belongs to the **ChatGPT conversation**, keyed from `_meta["openai/session"]` (the raw identifier is hashed, never stored), so simultaneous chats can hold different projects and a later turn recovers its own root after MCP reconnects or a server restart. A client that sends no ChatGPT conversation metadata falls back to a binding that lasts only the current MCP transport session.
 - With the default worktree mode, the first conversation selecting a Git project uses the source checkout directly. Once that logical project is already assigned, another conversation receives a detached managed worktree under the configured Codex worktree location, preventing concurrent chats from editing the same checkout. A branch, PR, or commit URL also receives a detached worktree when the existing source checkout is on another commit. `always` isolates every selection; `never` uses the source directly and therefore rejects a targeted URL unless that source is already at the requested commit.
 - Worktree identity uses the repository's Git common directory plus the selected path relative to its Git root. Linked worktrees are therefore recognised as the same repository, while separate subprojects in a monorepo remain distinct.
-- A conversation cannot switch roots once bound — start another chat for a different project. Re-selecting the same canonical path or exact normalized GitHub selection is idempotent. A different repository, branch, PR, or commit URL is rejected before any clone or fetch begins.
+- `set_project_root` never switches an existing binding automatically. Re-selecting the same canonical path or exact normalized GitHub selection is idempotent. After an explicit human request, `switch_project_root(path, expected_project_root, confirm=true)` can switch a ChatGPT conversation; it waits for in-flight calls, rejects active native commands, backs up the old binding and preserves both projects and previous worktrees. The current source root must match `expected_project_root`. Clients with a cached catalogue can use `mcp_call_tool(source="local_projects", tool="switch", arguments={...})`. Read `get_agent_brief` after switching. Clients without stable ChatGPT metadata must start a new session.
 - Until a root is selected, project-scoped tools are unavailable and say why. `list_projects` and `set_project_root` are the two project-independent tools present for this workflow.
 
 ### Project catalogue semantics
@@ -1278,6 +1277,7 @@ When `remote-exec` was imported from Codex, that overlay is sufficient; include 
 - `disabled: true` keeps an entry configured but skips it (reported as `-> disabled`).
 - `tools: ["exec", "machine_list", ...]` is an allow-list over raw upstream names.
 - `disabledTools: ["dangerous_write", ...]` removes tools after the allow-list.
+- `allowedOauthScopes: ["openid", "mcp.read", ...]` limits scopes accepted from a shared Codex OAuth credential. Explicit native Codex `scopes` are inherited automatically. A broader grant or a grant whose scope is unknown is rejected before any authenticated request. Without a configured limit the existing compatibility behavior is retained.
 - `cwd` selects a stdio child process's working directory.
 - `startupTimeoutSec` bounds initialization plus complete paginated `tools/list`; the default is 20 seconds.
 - `toolTimeoutSec` bounds each forwarded call and sends MCP cancellation when the limit expires.
@@ -1358,6 +1358,14 @@ deliberately re-parents or daemonises itself still escapes, so check for strays
 if a run leaves something listening.
 
 The native OpenAI tunnel removes the general public-URL exposure, but it does not reduce the authority of a successful tool call. Keep tunnel and connector permissions narrow, do not point Codex Free at directories you do not trust the model with, and set `exec.mode` and the command allowlists tighter than the defaults when the work directory is sensitive. In multi-project mode, the entire access-root subtree is intentionally selectable, so treat the whole subtree as sensitive. For an external tunnel, require tunnel-level access control rather than relying on URL secrecy.
+
+## Local macOS updates
+
+The optional [App Server bridge](integrations/codex-app-server-bridge/README.md) keeps host paths in an ignored personal configuration; its checked-in example contains generic defaults. It forwards human confirmations as resumable operations and preserves MCP images.
+
+For an existing locally signed LaunchAgent installation, copy `scripts/install.config.example.json` to `~/.codex-free/install.local.json` and enter the existing service paths, stable signing identifier and public identity metadata file. Each app needs its own identifier; multiple apps may use the same local certificate. Keep the private key in the login keychain and allow only the signing tool to use it. These installers do not generate keys, change trust or request authentication repeatedly.
+
+Run `python3 scripts/install-stable-signed.py --source target/release/codex-free --check` for preflight, then `scripts/install-local-signed.sh` for an offline build and update. Both installer paths stage and strictly verify the new signature against the previous designated requirement before atomic replacement, and restore the old executable if service health fails. `install-fallback-ready.py --apply-unrestricted` also changes execution policy and is a separate opt-in operation. Personal maintenance records, local configuration and `output/` stay outside Git.
 
 ## Dev commands
 

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "codexCli": "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
+  "workDir": "/absolute/path/to/workspace",
+  "codexHome": "~/.codex",
+  "requestTimeoutMs": 120000,
+  "confirmationTimeoutMs": 300000,
+  "allowRawRpc": false
+}

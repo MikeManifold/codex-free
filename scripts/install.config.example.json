@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "installationDir": "~/.local/opt/codex-free",
+  "serviceLabel": "local.example.codex-free",
+  "launchAgentPlist": "~/Library/LaunchAgents/local.example.codex-free.plist",
+  "signingIdentifier": "local.example.codex-free",
+  "signingIdentityFile": "~/.local/opt/codex-free/signing/identity.json",
+  "verifiedReleaseReceipt": "~/.codex-free/fallback-release.sha256"
+}

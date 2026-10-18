@@ -1,9 +1,12 @@
 # Rust build output
 /target
 
+# Python test caches
+__pycache__/
+*.py[cod]
+
 # Local build artifacts
 *.exe
-/codex-free
 /codex-free
 
 # Leftovers from the previous Bun/TypeScript build
@@ -11,3 +14,22 @@ node_modules/
 
 # Source archive drops (reference material, not part of the repo)
 *.zip
+
+# Personal operations notes and generated evidence stay on this machine.
+/AGENTS.md
+/docs/README.md
+/docs/maintenance/
+/docs/local-code-signing*.md
+/scripts/README.md
+/tests/README.md
+/output/
+
+# Personal configuration and credentials; examples remain versioned.
+*.local.json
+.env
+.env.*
+!.env.example
+.secrets/
+*.p12
+*.pfx
+*.key
