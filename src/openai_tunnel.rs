@@ -34,6 +34,73 @@ const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const LOG_TAIL_BYTES: u64 = 32 * 1024;
 const DETAIL_MAX_CHARS: usize = 2_000;
 const POLL_SUCCESS_METRIC: &str = "commands_poll_last_successful_timestamp_seconds";
+// A normal poll has a 30s wait plus a 5s deadline guardrail. Allow two missed
+// polls and backoff before treating a live-but-disconnected client as stalled.
+const POLL_STALL_TIMEOUT: Duration = Duration::from_secs(90);
+const POLL_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct PollProgress {
+    last_success: Option<(f64, Instant)>,
+}
+
+impl PollProgress {
+    fn observe(&mut self, metrics: &str, now: Instant, wall_time: SystemTime) -> TunnelHealth {
+        let Some(value) = parse_metric_value(metrics, POLL_SUCCESS_METRIC) else {
+            return TunnelHealth::Unhealthy(format!(
+                "tunnel-client metrics did not expose a valid {POLL_SUCCESS_METRIC}"
+            ));
+        };
+        if !value.is_finite() || value <= 0.0 {
+            return TunnelHealth::Unhealthy(
+                "waiting for a successful OpenAI control-plane poll".into(),
+            );
+        }
+
+        let Some((previous, last_progress)) = self.last_success else {
+            let Ok(wall_time) = wall_time.duration_since(UNIX_EPOCH) else {
+                return TunnelHealth::Unhealthy("system clock predates the Unix epoch".into());
+            };
+            let age = wall_time.as_secs_f64() - value;
+            if age >= POLL_STALL_TIMEOUT.as_secs_f64()
+                || age < -POLL_CLOCK_SKEW_ALLOWANCE.as_secs_f64()
+            {
+                return TunnelHealth::Unhealthy(format!(
+                    "initial control-plane poll timestamp is not recent (age {age:.0}s)"
+                ));
+            }
+            self.last_success = Some((value, now));
+            return TunnelHealth::Healthy;
+        };
+
+        // Polling intentionally pauses while the dispatch queue is full. A long
+        // tool call or human confirmation must not trigger a tunnel restart.
+        let polling_paused = match (
+            parse_metric_value(metrics, "commands_queue_length"),
+            parse_metric_value(metrics, "commands_queue_capacity"),
+        ) {
+            (Some(length), Some(capacity)) => {
+                length.is_finite() && capacity.is_finite() && capacity > 0.0 && length >= capacity
+            }
+            _ => false,
+        };
+        if value != previous || polling_paused {
+            // Progress, not wall-clock age, drives the running watchdog. Clock
+            // corrections in either direction cannot hide a frozen timestamp.
+            self.last_success = Some((value, now));
+            return TunnelHealth::Healthy;
+        }
+
+        let stalled_for = now.duration_since(last_progress);
+        if stalled_for >= POLL_STALL_TIMEOUT {
+            return TunnelHealth::Unhealthy(format!(
+                "OpenAI control-plane polling has not advanced for {}s",
+                stalled_for.as_secs()
+            ));
+        }
+        TunnelHealth::Healthy
+    }
+}
 
 pub(crate) fn validate_tunnel_id(value: &str) -> anyhow::Result<()> {
     if value.strip_prefix("tunnel_").is_some_and(|suffix| {
@@ -69,7 +136,7 @@ struct ReleaseAsset {
 /// gate startup readiness and to monitor a running tunnel. `Unreachable` means
 /// the probe itself failed (health endpoint down, connection refused/timeout);
 /// `Unhealthy` means the endpoint answered but reported the tunnel not ready
-/// (non-200, or the control-plane poll metric is missing/zero). The distinction
+/// (non-200, or control-plane polling is missing, invalid, or stalled). The distinction
 /// is diagnostic — both count as a health failure for the supervisor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunnelHealth {
@@ -94,6 +161,7 @@ pub struct RunningOpenAiTunnel {
     log_path: PathBuf,
     health_url: String,
     base_url: Url,
+    poll_progress: PollProgress,
 }
 
 impl RunningOpenAiTunnel {
@@ -103,8 +171,8 @@ impl RunningOpenAiTunnel {
 
     /// Probes the running tunnel's local health endpoints. Cheap and side-effect
     /// free, so the supervisor can call it on a fixed interval.
-    pub async fn check_health(&self, client: &Client) -> TunnelHealth {
-        probe_tunnel_health(client, &self.base_url).await
+    pub async fn check_health(&mut self, client: &Client) -> TunnelHealth {
+        probe_tunnel_health(client, &self.base_url, &mut self.poll_progress).await
     }
 
     pub async fn wait_for_exit(&mut self) -> anyhow::Error {
@@ -175,13 +243,14 @@ pub async fn start(config: &AppConfig) -> anyhow::Result<RunningOpenAiTunnel> {
     drop(control_plane_api_key);
     drop(internal_mcp_authorization);
 
-    let base_url = match wait_until_ready(&mut child, &health_url_path, &log_path).await {
-        Ok(url) => url,
-        Err(error) => {
-            let _ = terminate_child(&mut child).await;
-            return Err(error);
-        }
-    };
+    let (base_url, poll_progress) =
+        match wait_until_ready(&mut child, &health_url_path, &log_path).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = terminate_child(&mut child).await;
+                return Err(error);
+            }
+        };
     let health_url = base_url.as_str().trim_end_matches('/').to_string();
 
     Ok(RunningOpenAiTunnel {
@@ -190,6 +259,7 @@ pub async fn start(config: &AppConfig) -> anyhow::Result<RunningOpenAiTunnel> {
         log_path,
         health_url,
         base_url,
+        poll_progress,
     })
 }
 
@@ -204,6 +274,10 @@ fn runtime_args(
         OsString::from(&settings.tunnel_id),
         OsString::from("--control-plane.api-key"),
         OsString::from(format!("env:{CHILD_CONTROL_PLANE_API_KEY_ENV}")),
+        OsString::from("--control-plane.poll-timeout"),
+        OsString::from("30s"),
+        OsString::from("--control-plane.poll-deadline-guardrail"),
+        OsString::from("5s"),
         OsString::from("--mcp.server-url"),
         OsString::from(target_url),
         OsString::from("--mcp.extra-headers"),
@@ -234,10 +308,11 @@ async fn wait_until_ready(
     child: &mut Child,
     health_url_path: &Path,
     log_path: &Path,
-) -> anyhow::Result<Url> {
+) -> anyhow::Result<(Url, PollProgress)> {
     let client = build_health_client()?;
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut last_detail = "waiting for tunnel-client to publish its health URL".to_string();
+    let mut poll_progress = PollProgress::default();
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -249,12 +324,14 @@ async fn wait_until_ready(
 
         if let Ok(raw) = std::fs::read_to_string(health_url_path) {
             match parse_loopback_health_url(&raw) {
-                Ok(base_url) => match probe_tunnel_health(&client, &base_url).await {
-                    TunnelHealth::Healthy => return Ok(base_url),
-                    TunnelHealth::Unhealthy(detail) | TunnelHealth::Unreachable(detail) => {
-                        last_detail = detail
+                Ok(base_url) => {
+                    match probe_tunnel_health(&client, &base_url, &mut poll_progress).await {
+                        TunnelHealth::Healthy => return Ok((base_url, poll_progress)),
+                        TunnelHealth::Unhealthy(detail) | TunnelHealth::Unreachable(detail) => {
+                            last_detail = detail
+                        }
                     }
-                },
+                }
                 Err(error) => last_detail = error.to_string(),
             }
         }
@@ -270,7 +347,11 @@ async fn wait_until_ready(
     }
 }
 
-async fn probe_tunnel_health(client: &Client, base_url: &Url) -> TunnelHealth {
+async fn probe_tunnel_health(
+    client: &Client,
+    base_url: &Url,
+    poll_progress: &mut PollProgress,
+) -> TunnelHealth {
     let ready_url = match base_url.join("readyz") {
         Ok(url) => url,
         Err(error) => {
@@ -330,15 +411,7 @@ async fn probe_tunnel_health(client: &Client, base_url: &Url) -> TunnelHealth {
         }
     };
 
-    match parse_metric_value(&metrics, POLL_SUCCESS_METRIC) {
-        Some(value) if value > 0.0 => TunnelHealth::Healthy,
-        Some(_) => {
-            TunnelHealth::Unhealthy("waiting for a successful OpenAI control-plane poll".into())
-        }
-        None => TunnelHealth::Unhealthy(format!(
-            "tunnel-client metrics did not expose {POLL_SUCCESS_METRIC}"
-        )),
-    }
+    poll_progress.observe(&metrics, Instant::now(), SystemTime::now())
 }
 
 fn parse_metric_value(metrics: &str, name: &str) -> Option<f64> {
@@ -608,6 +681,8 @@ async fn validate_client(path: &Path, exact_version: Option<&str>) -> anyhow::Re
     let help_output = command_output(&help.stdout, &help.stderr);
     if !help.status.success()
         || !help_output.contains("--control-plane.tunnel-id")
+        || !help_output.contains("--control-plane.poll-timeout")
+        || !help_output.contains("--control-plane.poll-deadline-guardrail")
         || !help_output.contains("--mcp.server-url")
         || !help_output.contains("--mcp.extra-headers")
         || !help_output.contains("--mcp.discovery-extra-headers")
@@ -865,6 +940,14 @@ mod tests {
                 "--control-plane.api-key",
                 "env:CODEX_FREE_OPENAI_TUNNEL_API_KEY"
             ]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--control-plane.poll-timeout", "30s"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--control-plane.poll-deadline-guardrail", "5s"])
+        );
         assert!(args.windows(2).any(|pair| pair
             == [
                 "--mcp.extra-headers",
@@ -932,16 +1015,190 @@ mod tests {
         assert_eq!(parse_metric_value(metrics, "missing"), None);
     }
 
+    fn poll_metrics(value: f64) -> String {
+        format!("{POLL_SUCCESS_METRIC}{{otel_scope_name=\"controlplane\"}} {value}\n")
+    }
+
+    #[test]
+    fn stalled_positive_poll_is_unhealthy_and_new_progress_recovers() {
+        let now = Instant::now();
+        let stamp = 2_000_000_000.0;
+        let wall = UNIX_EPOCH + Duration::from_secs(stamp as u64);
+        let mut progress = PollProgress::default();
+        let frozen = poll_metrics(stamp);
+        assert_eq!(progress.observe(&frozen, now, wall), TunnelHealth::Healthy);
+        assert_eq!(
+            progress.observe(
+                &frozen,
+                now + POLL_STALL_TIMEOUT - Duration::from_secs(1),
+                wall
+            ),
+            TunnelHealth::Healthy
+        );
+        assert!(matches!(
+            progress.observe(&frozen, now + POLL_STALL_TIMEOUT, wall),
+            TunnelHealth::Unhealthy(detail) if detail.contains("not advanced for 90s")
+        ));
+        assert_eq!(
+            progress.observe(
+                &poll_metrics(stamp + 100.0),
+                now + Duration::from_secs(100),
+                wall
+            ),
+            TunnelHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn idle_long_polls_keep_the_watchdog_healthy() {
+        let now = Instant::now();
+        let stamp = 2_000_000_000;
+        let wall = UNIX_EPOCH + Duration::from_secs(stamp);
+        let mut progress = PollProgress::default();
+        for elapsed in (0..=600).step_by(30) {
+            assert_eq!(
+                progress.observe(
+                    &poll_metrics((stamp + elapsed) as f64),
+                    now + Duration::from_secs(elapsed),
+                    wall,
+                ),
+                TunnelHealth::Healthy
+            );
+        }
+    }
+
+    #[test]
+    fn initial_poll_must_be_finite_positive_and_recent() {
+        let now = Instant::now();
+        let stamp = 2_000_000_000.0;
+        let wall = UNIX_EPOCH + Duration::from_secs(stamp as u64);
+        for value in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            stamp - POLL_STALL_TIMEOUT.as_secs_f64(),
+            stamp + POLL_CLOCK_SKEW_ALLOWANCE.as_secs_f64() + 1.0,
+        ] {
+            let mut progress = PollProgress::default();
+            assert!(
+                matches!(
+                    progress.observe(&poll_metrics(value), now, wall),
+                    TunnelHealth::Unhealthy(_)
+                ),
+                "accepted invalid initial poll {value}"
+            );
+            assert!(progress.last_success.is_none());
+        }
+        assert!(matches!(
+            PollProgress::default().observe("other_metric 1\n", now, wall),
+            TunnelHealth::Unhealthy(_)
+        ));
+    }
+
+    #[test]
+    fn clock_corrections_cannot_mask_a_stall_or_reject_actual_progress() {
+        let now = Instant::now();
+        let stamp = 2_000_000_000;
+        let wall = UNIX_EPOCH + Duration::from_secs(stamp);
+        for corrected_wall in [
+            wall - Duration::from_secs(3600),
+            wall,
+            wall + Duration::from_secs(3600),
+        ] {
+            let mut progress = PollProgress::default();
+            let frozen = poll_metrics(stamp as f64);
+            assert_eq!(progress.observe(&frozen, now, wall), TunnelHealth::Healthy);
+            assert!(matches!(
+                progress.observe(&frozen, now + POLL_STALL_TIMEOUT, corrected_wall),
+                TunnelHealth::Unhealthy(_)
+            ));
+        }
+        let mut progress = PollProgress::default();
+        assert_eq!(
+            progress.observe(&poll_metrics(stamp as f64), now, wall),
+            TunnelHealth::Healthy
+        );
+        assert_eq!(
+            progress.observe(
+                &poll_metrics((stamp - 3600) as f64),
+                now + Duration::from_secs(30),
+                wall - Duration::from_secs(3600),
+            ),
+            TunnelHealth::Healthy
+        );
+        assert!(matches!(
+            progress.observe(
+                &poll_metrics((stamp - 3600) as f64),
+                now + Duration::from_secs(30) + POLL_STALL_TIMEOUT,
+                wall - Duration::from_secs(3600),
+            ),
+            TunnelHealth::Unhealthy(_)
+        ));
+    }
+
+    #[test]
+    fn a_full_dispatch_queue_pauses_the_watchdog_until_polling_can_resume() {
+        let now = Instant::now();
+        let stamp = 2_000_000_000;
+        let wall = UNIX_EPOCH + Duration::from_secs(stamp);
+        let mut progress = PollProgress::default();
+        let frozen = poll_metrics(stamp as f64);
+        assert_eq!(progress.observe(&frozen, now, wall), TunnelHealth::Healthy);
+        let full = format!("{frozen}commands_queue_length 20\ncommands_queue_capacity 20\n");
+        for elapsed in (10..=600).step_by(10) {
+            assert_eq!(
+                progress.observe(&full, now + Duration::from_secs(elapsed), wall),
+                TunnelHealth::Healthy
+            );
+        }
+        let resumed = now + Duration::from_secs(600);
+        assert_eq!(
+            progress.observe(&frozen, resumed + Duration::from_secs(10), wall),
+            TunnelHealth::Healthy
+        );
+        assert!(matches!(
+            progress.observe(&frozen, resumed + POLL_STALL_TIMEOUT, wall),
+            TunnelHealth::Unhealthy(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_queue_metrics_cannot_hide_a_frozen_poller() {
+        let now = Instant::now();
+        let stamp = 2_000_000_000;
+        let wall = UNIX_EPOCH + Duration::from_secs(stamp);
+        for (length, capacity) in [("0", "0"), ("NaN", "20"), ("inf", "20"), ("20", "inf")] {
+            let mut progress = PollProgress::default();
+            let frozen = poll_metrics(stamp as f64);
+            assert_eq!(progress.observe(&frozen, now, wall), TunnelHealth::Healthy);
+            let metrics = format!(
+                "{frozen}commands_queue_length {length}\ncommands_queue_capacity {capacity}\n"
+            );
+            assert!(matches!(
+                progress.observe(&metrics, now + POLL_STALL_TIMEOUT, wall),
+                TunnelHealth::Unhealthy(_)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn runtime_only_health_contract_needs_no_admin_api() {
         use axum::{Router, routing::get};
 
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let metrics = poll_metrics(stamp);
         let app = Router::new()
             .route("/readyz", get(|| async { "ready" }))
             .route(
                 "/metrics",
-                get(|| async {
-                    "commands_poll_last_successful_timestamp_seconds{otel_scope_name=\"controlplane\"} 1787429375\n"
+                get(move || {
+                    let metrics = metrics.clone();
+                    async move { metrics }
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -959,10 +1216,18 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+        let mut progress = PollProgress::default();
         assert_eq!(
-            probe_tunnel_health(&client, &base_url).await,
+            probe_tunnel_health(&client, &base_url, &mut progress).await,
             TunnelHealth::Healthy
         );
+        // Reproduce the incident: /readyz stays 200 and the positive success
+        // timestamp remains present, but the poller has stopped progressing.
+        progress.last_success = Some((stamp, Instant::now() - POLL_STALL_TIMEOUT));
+        assert!(matches!(
+            probe_tunnel_health(&client, &base_url, &mut progress).await,
+            TunnelHealth::Unhealthy(detail) if detail.contains("not advanced")
+        ));
 
         server.abort();
     }
