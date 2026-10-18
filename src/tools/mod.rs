@@ -27,6 +27,7 @@ pub mod setup;
 pub mod show_changes;
 pub mod skills_list;
 pub mod skills_read;
+pub mod switch_project_root;
 pub mod tree;
 pub mod update_plan;
 pub mod view_image;

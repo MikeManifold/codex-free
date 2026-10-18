@@ -543,7 +543,8 @@ async fn chatgpt_conversation_cannot_switch_projects_after_restart() {
         .await
         .unwrap_err();
     assert!(error.contains("already bound"));
-    assert!(error.contains("Start a new chat"));
+    assert!(error.contains("switch_project_root"));
+    assert!(error.contains("start a new chat"));
 }
 
 #[tokio::test]

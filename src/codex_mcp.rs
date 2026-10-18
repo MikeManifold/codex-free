@@ -337,6 +337,7 @@ fn codex_cli_server_to_spec(
             http_headers: server.transport.http_headers.unwrap_or_default(),
             env_http_headers: server.transport.env_http_headers.unwrap_or_default(),
             shared_codex_oauth: false,
+            allowed_oauth_scopes: None,
             startup_timeout_sec,
             tool_timeout_sec,
             tools: server.enabled_tools,
@@ -404,6 +405,7 @@ fn codex_cli_server_to_spec(
         http_headers: HashMap::new(),
         env_http_headers: HashMap::new(),
         shared_codex_oauth: false,
+        allowed_oauth_scopes: None,
         startup_timeout_sec,
         tool_timeout_sec,
         tools: server.enabled_tools,
@@ -534,6 +536,7 @@ fn parse_server(
         "experimental_environment",
         "http_headers",
         "http_headers_helper",
+        "scopes",
         "startup_timeout_ms",
         "startup_timeout_sec",
         "tool_timeout_sec",
@@ -604,6 +607,7 @@ fn parse_server(
                 http_headers: HashMap::new(),
                 env_http_headers: HashMap::new(),
                 shared_codex_oauth: false,
+                allowed_oauth_scopes: None,
                 startup_timeout_sec,
                 tool_timeout_sec,
                 tools,
@@ -653,6 +657,7 @@ fn parse_server(
             http_headers: optional_string_map(table, "http_headers")?.unwrap_or_default(),
             env_http_headers: optional_string_map(table, "env_http_headers")?.unwrap_or_default(),
             shared_codex_oauth: false,
+            allowed_oauth_scopes: optional_string_list(table, "scopes")?,
             startup_timeout_sec,
             tool_timeout_sec,
             tools,
@@ -850,6 +855,7 @@ enabled = false
 [mcp_servers.web]
 url = "https://example.invalid/mcp"
 bearer_token_env_var = "WEB_TOKEN"
+scopes = ["openid", "mcp.read"]
 startup_timeout_sec = 12
 tool_timeout_sec = 34.5
 http_headers = { X-Static = "public" }
@@ -875,6 +881,10 @@ environment_id = "executor"
         );
         assert_eq!(web.startup_timeout_sec, Some(12.0));
         assert_eq!(web.tool_timeout_sec, Some(34.5));
+        assert_eq!(
+            web.allowed_oauth_scopes,
+            Some(vec!["openid".into(), "mcp.read".into()])
+        );
         assert!(!outcome.servers.contains_key("remote"));
         let report = outcome.report.join("\n");
         assert!(report.contains("web -> imported from Codex"));

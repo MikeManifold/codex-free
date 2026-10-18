@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use rmcp::model::RequestMetaObject;
@@ -107,6 +108,7 @@ pub struct ProjectRootSelection {
 #[derive(Debug, Clone)]
 pub struct ProjectBindingStore {
     base_dir: PathBuf,
+    call_locks: Arc<Mutex<HashMap<ConversationIdentity, Weak<tokio::sync::RwLock<()>>>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -170,7 +172,21 @@ impl ProjectBindingStore {
     }
 
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            call_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn call_lock(&self, identity: &ConversationIdentity) -> Arc<tokio::sync::RwLock<()>> {
+        let mut locks = self.call_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(identity).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        locks.insert(identity.clone(), Arc::downgrade(&lock));
+        lock
     }
 
     pub fn base_dir(&self) -> &Path {
@@ -214,6 +230,28 @@ impl ProjectBindingStore {
         identity: &ConversationIdentity,
         input: &str,
     ) -> Result<ProjectRootSelection, String> {
+        self.select_project_root_inner(config, identity, input, None)
+            .await
+    }
+
+    pub async fn switch_project_root(
+        &self,
+        config: &AppConfig,
+        identity: &ConversationIdentity,
+        input: &str,
+        expected: &str,
+    ) -> Result<ProjectRootSelection, String> {
+        self.select_project_root_inner(config, identity, input, Some(expected))
+            .await
+    }
+
+    async fn select_project_root_inner(
+        &self,
+        config: &AppConfig,
+        identity: &ConversationIdentity,
+        input: &str,
+        expected: Option<&str>,
+    ) -> Result<ProjectRootSelection, String> {
         if !config.multi_project {
             return Err(
                 "Project-root selection is disabled. Start codex-free with `--multi-project` or set `multiProject` to true."
@@ -225,7 +263,14 @@ impl ProjectBindingStore {
         let binding_path = self.binding_path(&access_root, identity);
         let binding_lock = acquire_lock(&binding_path).await?;
 
+        let mut previous = None;
         if let Some(mut current) = self.read_binding(&binding_path, &access_root)? {
+            if let Some(expected) = expected {
+                let (_, expected) = resolve_project_root(config, expected)?;
+                if expected != current.source_project_root {
+                    return Err("The current source project differs from expected_project_root; no binding changed.".to_string());
+                }
+            }
             if project_reference_matches(
                 config,
                 &reference,
@@ -250,11 +295,21 @@ impl ProjectBindingStore {
                 ));
             }
 
-            return Err(format!(
-                "This ChatGPT conversation is already bound to source project `{}` and cannot switch to `{}`. Start a new chat for another project.",
-                current.source_project_root.display(),
-                reference.display()
-            ));
+            if expected.is_none() {
+                return Err(format!(
+                    "This ChatGPT conversation is already bound to source project `{}` and cannot switch to `{}` automatically. Use switch_project_root only after an explicit user request, or start a new chat.",
+                    current.source_project_root.display(),
+                    reference.display()
+                ));
+            }
+            previous =
+                Some(std::fs::read(&binding_path).map_err(|error| {
+                    format!("Could not back up the old project binding: {error}")
+                })?);
+        } else if expected.is_some() {
+            return Err(
+                "There is no existing project binding to switch; use set_project_root.".to_string(),
+            );
         }
 
         let prepared = prepare_project_root(config, &reference).await?;
@@ -320,6 +375,39 @@ impl ProjectBindingStore {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
         };
+        // Preserve the old binding until the new project is fully prepared.
+        // Backups are not active assignments and must never be published.
+        let backup = if let Some(previous) = previous {
+            let counter = ATOMIC_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let backup = binding_path.with_extension(format!(
+                "json.previous.{}.{}",
+                std::process::id(),
+                counter
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let result = (|| -> std::io::Result<()> {
+                let mut file = options.open(&backup)?;
+                file.write_all(&previous)?;
+                file.sync_all()
+            })();
+            if let Err(error) = result {
+                if let Some(worktree) = managed.as_ref() {
+                    let _ = rollback_managed_worktree(config, worktree).await;
+                }
+                return Err(format!(
+                    "Could not preserve the old binding; no project switched: {error}"
+                ));
+            }
+            Some(backup)
+        } else {
+            None
+        };
         if let Err(error) = self.write_binding(&binding_path, &stored) {
             let rollback = match managed.as_ref() {
                 Some(worktree) => rollback_managed_worktree(config, worktree).await.err(),
@@ -335,6 +423,10 @@ impl ProjectBindingStore {
 
         drop(assignment_lock);
         drop(binding_lock);
+
+        if let Some(backup) = backup {
+            warnings.push(format!("Previous project binding preserved at {}. Existing files and review checkpoints were not changed.", backup.display()));
+        }
 
         Ok(selection_from_binding(
             access_root,
@@ -356,7 +448,7 @@ impl ProjectBindingStore {
         }
         let access_root = canonical_access_root(config)?;
         let mut roots = HashSet::new();
-        for path in self.binding_files(&access_root) {
+        for path in self.binding_files_with_backups(&access_root) {
             if let Ok(Some(binding)) = self.read_binding(&path, &access_root)
                 && binding.managed_worktree
             {
@@ -402,6 +494,18 @@ impl ProjectBindingStore {
     }
 
     fn binding_files(&self, access_root: &Path) -> Vec<PathBuf> {
+        self.binding_files_with_backups(access_root)
+            .into_iter()
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect()
+    }
+
+    // A deliberate project switch preserves the previous worktree until its
+    // binding backup is explicitly removed. Automatic cleanup must not collect it.
+    fn binding_files_with_backups(&self, access_root: &Path) -> Vec<PathBuf> {
         let directory = self.access_root_dir(access_root);
         let Ok(entries) = std::fs::read_dir(directory) else {
             return Vec::new();
@@ -411,9 +515,12 @@ impl ProjectBindingStore {
             .filter_map(|entry| {
                 let path = entry.path();
                 (entry.file_type().ok()?.is_file()
-                    && path
+                    && (path
                         .extension()
-                        .is_some_and(|extension| extension == "json"))
+                        .is_some_and(|extension| extension == "json")
+                        || path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().contains(".json.previous.")
+                        })))
                 .then_some(path)
             })
             .collect()

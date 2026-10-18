@@ -13,14 +13,14 @@ use rmcp::model::{
 };
 use rmcp::service::Peer;
 use serde_json::{Map, Value, json};
-use tokio_util::sync::CancellationToken;
 
-use crate::bridge::forward_tool_call;
+use crate::bridge::{attach_call_owner, forward_tool_call};
 use crate::exec_sessions::SessionState;
 use crate::local_ui;
 use crate::tool::{Tool, ToolCallIdentity, ToolRequestContext};
 use crate::tools::exec_command::ExecCommand;
 use crate::tools::render_ui::RenderUi;
+use crate::tools::switch_project_root::SwitchProjectRoot;
 use crate::types::{AppConfig, McpServerProvenance, ToolResult};
 
 pub(crate) const MCP_LIST_SOURCES: &str = "mcp_list_sources";
@@ -32,6 +32,25 @@ const LOCAL_UI_SOURCE_ID: &str = "local_ui";
 const LOCAL_UI_TOOL_ID: &str = "render_html";
 const LOCAL_SHELL_SOURCE_ID: &str = "local_shell";
 const LOCAL_SHELL_TOOL_ID: &str = "exec";
+const LOCAL_PROJECTS_SOURCE_ID: &str = "local_projects";
+
+fn project_switch_metadata() -> Value {
+    json!({"source":{"id":LOCAL_PROJECTS_SOURCE_ID,"name":LOCAL_PROJECTS_SOURCE_ID,"provenance":"native","transport":"in-process","toolCount":1},
+        "tool":{"id":"switch","name":"switch","description":SwitchProjectRoot.description(),"inputSchema":SwitchProjectRoot.input_schema(),"annotations":SwitchProjectRoot.annotations()}})
+}
+
+fn project_switch_query(query: &str) -> bool {
+    let query = query.to_lowercase();
+    query.contains("switch")
+        || query.contains("project")
+        || query.contains("binding")
+        || query.contains("切换")
+        || query.contains("绑定")
+}
+
+fn project_switch_match() -> Value {
+    json!({"sourceId":LOCAL_PROJECTS_SOURCE_ID,"toolId":"switch","name":"switch","title":"Explicit project switch","description":SwitchProjectRoot.description(),"score":1.0})
+}
 
 const DEFAULT_SOURCE_LIMIT: usize = 50;
 const MAX_SOURCE_LIMIT: usize = 100;
@@ -952,6 +971,16 @@ impl Tool for McpSearchToolsTool {
             Ok(limit) => limit,
             Err(error) => return ToolResult::error(error),
         };
+        if source == Some(LOCAL_PROJECTS_SOURCE_ID) {
+            let matches = if project_switch_query(query) {
+                vec![project_switch_match()]
+            } else {
+                Vec::new()
+            };
+            return structured_json(
+                json!({"query":query,"source":source,"total":matches.len(),"matches":matches}),
+            );
+        }
         if source == Some(LOCAL_UI_SOURCE_ID) {
             let matches = if local_ui_query_matches(query) {
                 vec![local_ui_search_match()]
@@ -986,6 +1015,9 @@ impl Tool for McpSearchToolsTool {
             Ok(mut value) => {
                 if source.is_none() {
                     let mut synthetic = Vec::new();
+                    if project_switch_query(query) {
+                        synthetic.push(project_switch_match());
+                    }
                     if local_shell_query_matches(query) {
                         synthetic.push(local_shell_search_match());
                     }
@@ -1089,6 +1121,13 @@ impl Tool for McpGetToolTool {
             Ok(tool) => tool,
             Err(error) => return ToolResult::error(error),
         };
+        if source_id == LOCAL_PROJECTS_SOURCE_ID {
+            return if tool_id == "switch" {
+                structured_json(project_switch_metadata())
+            } else {
+                ToolResult::error("Unknown local_projects tool")
+            };
+        }
         if source_id == LOCAL_UI_SOURCE_ID {
             if tool_id == LOCAL_UI_TOOL_ID {
                 return structured_json(local_ui_tool_metadata());
@@ -1129,7 +1168,7 @@ impl McpCallToolTool {
         args: Value,
         config: &AppConfig,
         session: &SessionState,
-        cancellation: Option<&CancellationToken>,
+        context: Option<&ToolRequestContext>,
     ) -> ToolResult {
         let source_id = match required_string(&args, "source") {
             Ok(source) => source,
@@ -1139,6 +1178,23 @@ impl McpCallToolTool {
             Ok(tool) => tool,
             Err(error) => return ToolResult::error(error),
         };
+        if source_id == LOCAL_PROJECTS_SOURCE_ID {
+            if tool_id != "switch" {
+                return ToolResult::error("Unknown local_projects tool");
+            }
+            let arguments = match args.get("arguments") {
+                Some(Value::Object(arguments)) => Value::Object(arguments.clone()),
+                _ => return ToolResult::error("Project switch arguments must be a JSON object"),
+            };
+            return match context {
+                Some(context) => {
+                    SwitchProjectRoot
+                        .call_with_context(arguments, config, session, context)
+                        .await
+                }
+                None => SwitchProjectRoot.call(arguments, config, session).await,
+            };
+        }
         if source_id == LOCAL_UI_SOURCE_ID {
             if tool_id != LOCAL_UI_TOOL_ID {
                 return ToolResult::error(format!(
@@ -1200,13 +1256,14 @@ impl McpCallToolTool {
             }
         }
 
+        attach_call_owner(&mut params, context, session);
         forward_tool_call(
             &source.peer,
             params,
             &source.raw_name,
             tool.raw.name.as_ref(),
             source.tool_timeout,
-            cancellation,
+            context.map(|context| &context.cancellation),
         )
         .await
     }
@@ -1308,6 +1365,9 @@ impl Tool for McpCallToolTool {
             args.get("source").and_then(Value::as_str),
             args.get("tool").and_then(Value::as_str),
         ) {
+            (Some(LOCAL_PROJECTS_SOURCE_ID), Some("switch")) => {
+                SwitchProjectRoot.execution_policy(nested_args)
+            }
             (Some(LOCAL_SHELL_SOURCE_ID), Some(LOCAL_SHELL_TOOL_ID)) => {
                 ExecCommand.execution_policy(nested_args)
             }
@@ -1333,8 +1393,7 @@ impl Tool for McpCallToolTool {
         session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, config, session, Some(&context.cancellation))
-            .await
+        self.run(args, config, session, Some(context)).await
     }
 }
 

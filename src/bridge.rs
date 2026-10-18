@@ -71,7 +71,12 @@ struct BridgedTool {
 }
 
 impl BridgedTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        context: Option<&ToolRequestContext>,
+        session: &SessionState,
+    ) -> ToolResult {
         let mut params = CallToolRequestParams::new(self.original_name.clone());
         if let Some(obj) = args.as_object()
             && !obj.is_empty()
@@ -79,13 +84,14 @@ impl BridgedTool {
             params = params.with_arguments(obj.clone());
         }
 
+        attach_call_owner(&mut params, context, session);
         forward_tool_call(
             &self.peer,
             params,
             &self.server,
             &self.original_name,
             self.tool_timeout,
-            cancellation,
+            context.map(|context| &context.cancellation),
         )
         .await
     }
@@ -143,18 +149,37 @@ impl Tool for BridgedTool {
         false
     }
 
-    async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+    async fn call(&self, args: Value, _config: &AppConfig, session: &SessionState) -> ToolResult {
+        self.run(args, None, session).await
     }
 
     async fn call_with_context(
         &self,
         args: Value,
         _config: &AppConfig,
-        _session: &SessionState,
+        session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(args, Some(context), session).await
+    }
+}
+
+/// Scope deferred confirmations without forwarding the raw host conversation ID.
+pub(crate) fn attach_call_owner(
+    params: &mut CallToolRequestParams,
+    context: Option<&ToolRequestContext>,
+    session: &SessionState,
+) {
+    if let Some(context) = context {
+        let owner = context
+            .conversation
+            .as_ref()
+            .map(|identity| format!("conversation:{}", identity.audit_hash()))
+            .unwrap_or_else(|| format!("transport:{}", session.audit_id()));
+        params
+            .meta
+            .get_or_insert_with(Default::default)
+            .insert("codex-free/call-owner".to_string(), Value::String(owner));
     }
 }
 
@@ -544,7 +569,12 @@ struct GatewayTool {
 }
 
 impl GatewayTool {
-    async fn run(&self, args: Value, cancellation: Option<&CancellationToken>) -> ToolResult {
+    async fn run(
+        &self,
+        args: Value,
+        context: Option<&ToolRequestContext>,
+        session: &SessionState,
+    ) -> ToolResult {
         let Some(function) = args.get("function").and_then(|v| v.as_str()) else {
             return ToolResult::error("`function` is required (the name of the function to call)");
         };
@@ -570,13 +600,14 @@ impl GatewayTool {
             }
         }
 
+        attach_call_owner(&mut params, context, session);
         forward_tool_call(
             &self.peer,
             params,
             &self.server,
             function,
             self.tool_timeout,
-            cancellation,
+            context.map(|context| &context.cancellation),
         )
         .await
     }
@@ -629,18 +660,18 @@ impl Tool for GatewayTool {
         false
     }
 
-    async fn call(&self, args: Value, _config: &AppConfig, _session: &SessionState) -> ToolResult {
-        self.run(args, None).await
+    async fn call(&self, args: Value, _config: &AppConfig, session: &SessionState) -> ToolResult {
+        self.run(args, None, session).await
     }
 
     async fn call_with_context(
         &self,
         args: Value,
         _config: &AppConfig,
-        _session: &SessionState,
+        session: &SessionState,
         context: &ToolRequestContext,
     ) -> ToolResult {
-        self.run(args, Some(&context.cancellation)).await
+        self.run(args, Some(context), session).await
     }
 }
 
@@ -941,6 +972,7 @@ async fn connect_one_with_env(
                     build_upstream_client()?,
                     server_name,
                     url,
+                    spec.allowed_oauth_scopes.clone(),
                 );
                 let transport =
                     StreamableHttpClientTransport::with_client(client, transport_config);

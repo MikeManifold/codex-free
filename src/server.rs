@@ -316,10 +316,26 @@ impl ServerHandler for CodexHandler {
         });
         let name = request.name.as_ref().to_string();
         let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
+        let project_lock = conversation
+            .as_ref()
+            .map(|identity| self.project_bindings.call_lock(identity));
+        let switching = name == "switch_project_root"
+            || (name == "mcp_call_tool"
+                && args.get("source").and_then(Value::as_str) == Some("local_projects")
+                && args.get("tool").and_then(Value::as_str) == Some("switch"));
+        let _project_call_guard = if !switching {
+            match project_lock {
+                Some(lock) => Some(lock.read_owned().await),
+                None => None,
+            }
+        } else {
+            None
+        };
         let call_id = self.next_tool_call_id.fetch_add(1, Ordering::Relaxed);
         let tool_context = ToolRequestContext {
             conversation: conversation.clone(),
             conversation_authorizations: self.conversation_authorizations.clone(),
+            project_bindings: self.project_bindings.clone(),
             review_checkpoints: self.review_checkpoints.clone(),
             artifact_egress: self.artifact_egress.clone(),
             cancellation: context.ct.clone(),

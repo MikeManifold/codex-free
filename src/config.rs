@@ -326,6 +326,7 @@ struct CodexMcpConfig {
     enabled: Option<bool>,
     use_cli: Option<bool>,
     cli_path: Option<String>,
+    #[serde(alias = "shareOAuthFile")]
     share_oauth_file: Option<bool>,
 }
 
@@ -377,6 +378,7 @@ struct PartialMcpServerSpec {
     http_headers: Option<HashMap<String, String>>,
     env_http_headers: Option<HashMap<String, String>>,
     shared_codex_oauth: Option<bool>,
+    allowed_oauth_scopes: Option<Vec<String>>,
     startup_timeout_sec: Option<f64>,
     tool_timeout_sec: Option<f64>,
     tools: Option<Vec<String>>,
@@ -398,6 +400,7 @@ impl PartialMcpServerSpec {
             http_headers,
             env_http_headers,
             shared_codex_oauth,
+            allowed_oauth_scopes,
             startup_timeout_sec,
             tool_timeout_sec,
             tools,
@@ -446,6 +449,9 @@ impl PartialMcpServerSpec {
         }
         if let Some(shared_codex_oauth) = shared_codex_oauth {
             base.shared_codex_oauth = shared_codex_oauth;
+        }
+        if let Some(scopes) = allowed_oauth_scopes {
+            base.allowed_oauth_scopes = Some(scopes);
         }
         if let Some(startup_timeout_sec) = startup_timeout_sec {
             base.startup_timeout_sec = Some(startup_timeout_sec);
@@ -1488,6 +1494,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn accepts_shared_oauth_spelling_alias_but_rejects_conflicting_duplicates() {
+        let canonical: CodexMcpConfig = serde_json::from_str(r#"{"shareOauthFile":true}"#).unwrap();
+        let compatible: CodexMcpConfig =
+            serde_json::from_str(r#"{"shareOAuthFile":true}"#).unwrap();
+        assert_eq!(canonical.share_oauth_file, Some(true));
+        assert_eq!(compatible.share_oauth_file, Some(true));
+        assert!(
+            serde_json::from_str::<CodexMcpConfig>(
+                r#"{"shareOauthFile":true,"shareOAuthFile":false}"#
+            )
+            .is_err()
+        );
+    }
+
     fn imported_server() -> McpServerSpec {
         McpServerSpec {
             command: Some("codex-server".to_string()),
@@ -1501,6 +1522,7 @@ mod tests {
             http_headers: HashMap::new(),
             env_http_headers: HashMap::new(),
             shared_codex_oauth: false,
+            allowed_oauth_scopes: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
             tools: Some(vec!["read".to_string()]),

@@ -33,9 +33,10 @@ fn loads_all_29_tools() {
 #[test]
 fn multi_project_mode_adds_catalogue_and_session_selector() {
     let tools = load_tools_for_mode(true);
-    assert_eq!(tools.len(), 31);
+    assert_eq!(tools.len(), 32);
     assert_eq!(tools[0].name(), "list_projects");
     assert_eq!(tools[1].name(), "set_project_root");
+    assert_eq!(tools[2].name(), "switch_project_root");
 }
 
 #[test]
@@ -91,10 +92,11 @@ fn conversation_auth_mode_adds_innocuously_named_gate_before_protected_tools() {
 
     config.multi_project = true;
     let tools = load_tools_for_config(&config);
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 33);
     assert_eq!(tools[0].name(), "setup");
     assert_eq!(tools[1].name(), "list_projects");
     assert_eq!(tools[2].name(), "set_project_root");
+    assert_eq!(tools[3].name(), "switch_project_root");
 }
 
 #[test]

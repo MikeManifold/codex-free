@@ -137,6 +137,9 @@ mod tests {
         ToolRequestContext {
             conversation: identity,
             conversation_authorizations: authorizations,
+            project_bindings: Arc::new(crate::project_bindings::ProjectBindingStore::new(
+                std::env::temp_dir().join("unused-setup-bindings"),
+            )),
             review_checkpoints: Arc::new(ReviewCheckpointManager::new()),
             artifact_egress: Arc::new(crate::artifact_egress::ArtifactEgressStore::new(
                 crate::types::ArtifactEgressConfig::default(),

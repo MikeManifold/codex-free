@@ -281,6 +281,9 @@ mod tests {
         cancellation.cancel();
         let context = ToolRequestContext {
             conversation: None,
+            project_bindings: Arc::new(crate::project_bindings::ProjectBindingStore::new(
+                root.path().join("bindings"),
+            )),
             conversation_authorizations: Arc::new(
                 crate::conversation_auth::ConversationAuthorizationStore::new(),
             ),

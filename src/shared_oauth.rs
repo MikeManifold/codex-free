@@ -23,6 +23,7 @@ use rmcp::{
     },
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sse_stream::Sse;
 use zeroize::Zeroize;
 
@@ -33,31 +34,41 @@ pub(crate) struct SharedOAuthClient {
     client: reqwest::Client,
     server_name: String,
     server_url: String,
+    allowed_scopes: Option<Vec<String>>,
 }
 
 impl SharedOAuthClient {
-    pub(crate) fn new(client: reqwest::Client, server_name: &str, server_url: &str) -> Self {
+    pub(crate) fn new(
+        client: reqwest::Client,
+        server_name: &str,
+        server_url: &str,
+        allowed_scopes: Option<Vec<String>>,
+    ) -> Self {
         Self {
             client,
             server_name: server_name.to_owned(),
             server_url: server_url.to_owned(),
+            allowed_scopes,
         }
     }
 
     async fn token(&self) -> Result<Option<String>, StreamableHttpError<reqwest::Error>> {
         let name = self.server_name.clone();
         let url = self.server_url.clone();
-        tokio::task::spawn_blocking(move || read_access_token(&name, &url))
-            .await
-            .map_err(|_| auth_error())?
-            .map_err(|_| auth_error())
+        let allowed_scopes = self.allowed_scopes.clone();
+        tokio::task::spawn_blocking(move || {
+            read_access_token(&name, &url, allowed_scopes.as_deref())
+        })
+        .await
+        .map_err(|_| credential_error("credential read task failed"))?
+        .map_err(credential_error)
     }
 }
 
-fn auth_error() -> StreamableHttpError<reqwest::Error> {
-    StreamableHttpError::UnexpectedServerResponse(Cow::Borrowed(
-        "shared Codex MCP OAuth credential unavailable or expired; authorize this source in Codex",
-    ))
+fn credential_error(reason: &'static str) -> StreamableHttpError<reqwest::Error> {
+    StreamableHttpError::UnexpectedServerResponse(Cow::Owned(format!(
+        "shared Codex MCP OAuth credential unavailable: {reason}. Inspect the existing credential and Codex MCP status before starting any new authorization."
+    )))
 }
 
 #[derive(Deserialize)]
@@ -68,6 +79,7 @@ struct Credential {
     expires_at: Option<u64>,
     #[serde(default)]
     executor_owned: bool,
+    scopes: Option<Vec<String>>,
 }
 
 impl Drop for Credential {
@@ -84,15 +96,29 @@ fn codex_home() -> Result<PathBuf, &'static str> {
         .ok_or("Codex home unavailable")
 }
 
-fn read_access_token(server_name: &str, server_url: &str) -> Result<Option<String>, &'static str> {
+fn read_access_token(
+    server_name: &str,
+    server_url: &str,
+    allowed_scopes: Option<&[String]>,
+) -> Result<Option<String>, &'static str> {
     let home = codex_home()?;
-    read_access_token_in(&home, server_name, server_url)
+    read_access_token_in_with_scopes(&home, server_name, server_url, allowed_scopes)
 }
 
+#[cfg(test)]
 fn read_access_token_in(
     home: &std::path::Path,
     server_name: &str,
     server_url: &str,
+) -> Result<Option<String>, &'static str> {
+    read_access_token_in_with_scopes(home, server_name, server_url, None)
+}
+
+fn read_access_token_in_with_scopes(
+    home: &std::path::Path,
+    server_name: &str,
+    server_url: &str,
+    allowed_scopes: Option<&[String]>,
 ) -> Result<Option<String>, &'static str> {
     let lock_path = home.join("mcp-oauth-locks/file-store.lock");
     fs::create_dir_all(lock_path.parent().ok_or("Codex lock path unavailable")?)
@@ -153,28 +179,67 @@ fn read_access_token_in(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "system clock unavailable")?
         .as_millis() as u64;
-    let mut matched = None;
-    for entry in store.values() {
-        if !entry.executor_owned
-            && entry.server_name == local_name
-            && entry.server_url == server_url
-        {
-            if matched.is_some() {
-                return Err("multiple matching Codex MCP OAuth credentials");
-            }
-            if entry
+    // Prefer the same identity key as Codex. Legacy duplicate records must not
+    // shadow its current credential or make a rotated token ambiguous.
+    let payload = serde_json::json!({"headers": {}, "type": "http", "url": server_url});
+    let digest =
+        Sha256::digest(serde_json::to_vec(&payload).map_err(|_| "invalid OAuth identity")?);
+    let suffix: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let key = format!("{local_name}|{suffix}");
+    let eligible = |entry: &&Credential| {
+        !entry.executor_owned && entry.server_name == local_name && entry.server_url == server_url
+    };
+    let usable = |entry: &&Credential| {
+        !entry.access_token.is_empty()
+            && entry
                 .expires_at
-                .is_some_and(|expiry| expiry <= now.saturating_add(30_000))
+                .is_none_or(|expiry| expiry > now.saturating_add(30_000))
+    };
+    let check_scopes = |entry: &Credential| -> Result<(), &'static str> {
+        if let Some(allowed) = allowed_scopes {
+            let granted = entry
+                .scopes
+                .as_ref()
+                .ok_or("Shared OAuth grant scopes are unknown")?;
+            if granted
+                .iter()
+                .flat_map(|scope| scope.split_whitespace())
+                .any(|scope| !allowed.iter().any(|item| item == scope))
             {
-                return Err("Codex MCP OAuth credential expired");
+                return Err("Shared OAuth credential exceeds the configured scope limit");
             }
-            if entry.access_token.is_empty() {
-                return Err("Codex MCP OAuth credential is empty");
-            }
-            matched = Some(entry.access_token.clone());
         }
+        Ok(())
+    };
+    if let Some(entry) = store.get(&key).filter(eligible) {
+        return if usable(&entry) {
+            check_scopes(entry)?;
+            Ok(Some(entry.access_token.clone()))
+        } else {
+            Err("Codex MCP OAuth credential expired or empty")
+        };
     }
-    Ok(matched)
+    let matching: Vec<_> = store.values().filter(eligible).collect();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    let mut valid = matching.into_iter().filter(usable);
+    let Some(first) = valid.next() else {
+        return Err("Codex MCP OAuth credential expired or empty");
+    };
+    for entry in valid {
+        if entry.access_token != first.access_token {
+            return Err(
+                "multiple matching Codex MCP OAuth credentials; recover the source in Codex",
+            );
+        }
+        check_scopes(entry)?;
+    }
+    check_scopes(first)?;
+    Ok(Some(first.access_token.clone()))
 }
 
 impl StreamableHttpClient for SharedOAuthClient {
@@ -309,6 +374,87 @@ mod tests {
         assert_eq!(read().unwrap().as_deref(), Some("second"));
         write_credentials(home.path(), "expired", now - 1);
         assert!(read().is_err());
+    }
+
+    #[test]
+    fn explicit_scope_limits_reject_write_and_unknown_grants_before_use() {
+        let home = tempfile::tempdir().unwrap();
+        let allowed = vec!["openid".to_string(), "mcp.read".to_string()];
+        let read = || {
+            read_access_token_in_with_scopes(
+                home.path(),
+                "remote",
+                "https://example.test/mcp",
+                Some(&allowed),
+            )
+        };
+        write_credentials(home.path(), "fixture", u64::MAX);
+        assert!(
+            read().is_err(),
+            "Unknown grant scopes cannot prove read-only access"
+        );
+        let path = home.path().join(".credentials.json");
+        let mut data: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for scopes in [
+            serde_json::json!(["openid", "mcp.read", "mcp.write"]),
+            serde_json::json!(["mcp.read mcp.orders.submit"]),
+        ] {
+            data["key"]["scopes"] = scopes;
+            fs::write(&path, data.to_string()).unwrap();
+            assert!(read().is_err());
+        }
+        data["key"]["scopes"] = serde_json::json!(["openid", "mcp.read"]);
+        fs::write(&path, data.to_string()).unwrap();
+        assert_eq!(read().unwrap().as_deref(), Some("fixture"));
+    }
+
+    #[test]
+    fn canonical_credential_wins_over_expired_legacy_duplicates() {
+        let home = tempfile::tempdir().unwrap();
+        write_credentials(home.path(), "old", 1);
+        let path = home.path().join(".credentials.json");
+        let mut data: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let payload =
+            serde_json::json!({"headers": {}, "type": "http", "url": "https://example.test/mcp"});
+        let digest = Sha256::digest(serde_json::to_vec(&payload).unwrap());
+        let suffix: String = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        data[format!("remote|{suffix}")] = serde_json::json!({
+            "server_name": "remote", "server_url": "https://example.test/mcp",
+            "access_token": "current", "expires_at": u64::MAX
+        });
+        fs::write(&path, data.to_string()).unwrap();
+        assert_eq!(
+            read_access_token_in(home.path(), "remote", "https://example.test/mcp")
+                .unwrap()
+                .as_deref(),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_tokens_and_executor_owned_credentials_are_not_reused() {
+        let home = tempfile::tempdir().unwrap();
+        write_credentials(home.path(), "one", u64::MAX);
+        let path = home.path().join(".credentials.json");
+        let mut data: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        data["second"] = data["key"].clone();
+        data["second"]["access_token"] = serde_json::json!("two");
+        fs::write(&path, data.to_string()).unwrap();
+        assert!(read_access_token_in(home.path(), "remote", "https://example.test/mcp").is_err());
+        data["second"]["executor_owned"] = serde_json::json!(true);
+        fs::write(&path, data.to_string()).unwrap();
+        assert_eq!(
+            read_access_token_in(home.path(), "remote", "https://example.test/mcp")
+                .unwrap()
+                .as_deref(),
+            Some("one")
+        );
     }
 
     #[cfg(unix)]

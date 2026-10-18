@@ -547,6 +547,10 @@ pub struct McpServerSpec {
     /// Never writes credentials or independently refreshes a token.
     #[serde(default)]
     pub shared_codex_oauth: bool,
+    /// Maximum scopes accepted from a shared credential. Direct Codex imports
+    /// inherit an explicit native `scopes` list; broader grants fail closed.
+    #[serde(default)]
+    pub allowed_oauth_scopes: Option<Vec<String>>,
     /// Timeout for initialization and the first tools listing, in seconds.
     #[serde(default)]
     pub startup_timeout_sec: Option<f64>,

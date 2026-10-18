@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::artifact_egress::ArtifactEgressStore;
 use crate::conversation_auth::ConversationAuthorizationStore;
 use crate::exec_sessions::SessionState;
-use crate::project_bindings::ConversationIdentity;
+use crate::project_bindings::{ConversationIdentity, ProjectBindingStore};
 use crate::review::ReviewCheckpointManager;
 use crate::types::{AppConfig, ToolResult};
 
@@ -22,6 +22,7 @@ use crate::types::{AppConfig, ToolResult};
 pub struct ToolRequestContext {
     pub conversation: Option<ConversationIdentity>,
     pub conversation_authorizations: Arc<ConversationAuthorizationStore>,
+    pub project_bindings: Arc<ProjectBindingStore>,
     pub review_checkpoints: Arc<ReviewCheckpointManager>,
     pub artifact_egress: Arc<ArtifactEgressStore>,
     /// Cancelled when the transport drops or a per-call deadline (e.g. the

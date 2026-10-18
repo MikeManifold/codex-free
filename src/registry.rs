@@ -53,6 +53,7 @@ fn load_tools_with_options(
     if multi_project {
         all.push(Box::new(tools::list_projects::ListProjects));
         all.push(Box::new(tools::set_project_root::SetProjectRoot));
+        all.push(Box::new(tools::switch_project_root::SwitchProjectRoot));
     }
     all.push(Box::new(tools::read_file::ReadFile));
     all.push(Box::new(tools::write_file::WriteFile));
