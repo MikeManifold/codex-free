@@ -84,6 +84,11 @@ impl AppServerBridge {
         AppServerSession::info()
     }
 
+    #[cfg(test)]
+    pub(super) fn test_session(&self, owner: &str) -> Option<Arc<AppServerSession>> {
+        self.sessions.lock().unwrap().get(owner).cloned()
+    }
+
     fn shutdown(&self) {
         self.shutdown.cancel();
         for session in self.sessions.lock().unwrap().values() {

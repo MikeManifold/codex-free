@@ -64,6 +64,27 @@ mod subprocess {
             let cli = directory.path().join("fixture-cli");
             let log = directory.path().join("requests.jsonl");
             let mode = directory.path().join("mode.json");
+            let codex_home = directory.path().join("test-state");
+            let helper = codex_home
+                .join("computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService");
+            std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+            std::fs::write(
+                &helper,
+                r#"#!/usr/bin/python3
+import os, socket, signal
+s = socket.socket(socket.AF_UNIX)
+s.bind(os.environ['SKY_CUA_SERVICE_NATIVE_PIPE_PATH'])
+s.listen()
+signal.pause()
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(
+                codex_home.join("config.toml"),
+                "[mcp_servers.node_repl]\ncommand=\"fixture-cli\"\n",
+            )
+            .unwrap();
             std::fs::write(&mode, "{}").unwrap();
             std::fs::write(&cli, FIXTURE).unwrap();
             std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -78,6 +99,7 @@ mod subprocess {
                     version: Some(1),
                     codex_cli: Some(cli.to_string_lossy().into_owned()),
                     work_dir: Some(directory.path().to_string_lossy().into_owned()),
+                    codex_home: Some(codex_home.to_string_lossy().into_owned()),
                     request_timeout_ms: Some(1000),
                     confirmation_timeout_ms: Some(1000),
                     ..Default::default()
@@ -504,6 +526,11 @@ mod subprocess {
     #[tokio::test]
     async fn cancellation_kills_only_the_owned_fixture_and_can_reconnect() {
         let f = Fixture::new();
+        assert!(
+            !f.call("codex_mcp_status", json!({}), "owner")
+                .await
+                .is_error
+        );
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         let log = f.log.clone();
@@ -611,6 +638,314 @@ mod subprocess {
         let done=f.call("codex_confirmation_respond",json!({"operationId":v["operationId"],"confirmationId":v["confirmation"]["id"],"action":"accept","userConfirmed":true,"content":{"allow":true}}),"a").await;
         assert!(!done.is_error);
         assert_eq!(done.structured_content.unwrap()["data"], json!([]));
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn native_pid(f: &Fixture, owner: &str) -> u32 {
+        let session = f.adapter.test_session(owner).unwrap();
+        let conn = session.rpc.current().await.unwrap();
+        conn.native_ui.as_ref().unwrap().diagnostics().await["pid"]
+            .as_u64()
+            .unwrap() as u32
+    }
+
+    #[cfg(target_os = "macos")]
+    fn alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn explicit_end_stops_only_its_owned_native_helper() {
+        let f = Fixture::new();
+        let helper = f.directory.path().join(
+            "test-state/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService",
+        );
+        let original = std::fs::read_to_string(&helper).unwrap();
+        // A refuses the normal termination signal. B keeps the ordinary path;
+        // bounded forced cleanup must still target only A's owned Child.
+        std::fs::write(
+            &helper,
+            original.replace(
+                "s = socket.socket",
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ns = socket.socket",
+            ),
+        )
+        .unwrap();
+        for owner in ["native-a", "native-b"] {
+            let result = f.call("codex_cua_js", json!({"code":"use"}), owner).await;
+            assert!(!result.is_error, "{}", result.joined_text());
+            std::fs::write(&helper, &original).unwrap();
+        }
+        let a = native_pid(&f, "native-a").await;
+        let b = native_pid(&f, "native-b").await;
+        assert_ne!(a, b);
+        let result = f.call("codex_ui_session_end", json!({}), "native-a").await;
+        assert!(!result.is_error, "{}", result.joined_text());
+        assert_eq!(
+            result.structured_content.unwrap()["nativeUiCleanup"],
+            "owned_service_stopped"
+        );
+        assert!(!alive(a));
+        assert!(alive(b));
+        assert!(
+            !f.call("codex_cua_js", json!({"code":"still active"}), "native-b")
+                .await
+                .is_error
+        );
+        assert_eq!(native_pid(&f, "native-b").await, b);
+        assert!(
+            !f.call("codex_ui_session_end", json!({}), "native-b")
+                .await
+                .is_error
+        );
+        assert!(!alive(b));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn idle_reaping_stops_native_capture_owner_without_touching_live_caller() {
+        let f = Fixture::new();
+        for owner in ["native-a", "native-b"] {
+            assert!(
+                !f.call("codex_cua_js", json!({"code":"use"}), owner)
+                    .await
+                    .is_error
+            );
+        }
+        let a = native_pid(&f, "native-a").await;
+        let b = native_pid(&f, "native-b").await;
+        let now = tokio::time::Instant::now();
+        f.adapter
+            .test_session("native-a")
+            .unwrap()
+            .activity
+            .lock()
+            .unwrap()
+            .last_finished = now - Duration::from_secs(301);
+        f.adapter.reap_idle(now, lifecycle::IDLE_TIMEOUT).await;
+        assert!(!alive(a));
+        assert!(alive(b));
+        assert!(f.adapter.test_session("native-a").is_none());
+        assert!(
+            !f.call("codex_ui_session_end", json!({}), "native-b")
+                .await
+                .is_error
+        );
+        assert!(!alive(b));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn isolated_ui_uses_configured_repl_and_rejects_virtual_shared_runtime() {
+        let f = Fixture::new();
+        let status = f.call("codex_mcp_status", json!({}), "a").await;
+        let servers = &status.structured_content.unwrap()["data"];
+        assert!(
+            servers
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == "node_repl")
+        );
+        assert!(
+            !servers
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == "cua_repl")
+        );
+        let result = f.call("codex_cua_js", json!({"code":"fixture"}), "a").await;
+        assert!(!result.is_error, "{}", result.joined_text());
+        let calls = f
+            .requests()
+            .into_iter()
+            .filter(|r| r["method"] == "mcpServer/tool/call")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["params"]["server"], "node_repl");
+        let blocked = f
+            .call(
+                "codex_mcp_call",
+                json!({"server":"cua_repl","tool":"js","arguments":{"code":"must not run"}}),
+                "a",
+            )
+            .await;
+        assert!(blocked.is_error);
+        assert!(blocked.joined_text().contains("not caller-isolated"));
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "mcpServer/tool/call" && r["params"]["tool"] == "js")
+                .count(),
+            1
+        );
+        assert!(
+            !f.requests().iter().any(
+                |r| r["method"] == "mcpServer/tool/call" && r["params"]["server"] == "cua_repl"
+            )
+        );
+        assert!(
+            !f.call("codex_ui_session_end", json!({}), "a")
+                .await
+                .is_error
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn missing_native_helper_fails_before_ui_and_preserves_rescue() {
+        let f = Fixture::new();
+        std::fs::remove_file(f.directory.path().join(
+            "test-state/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService",
+        ))
+        .unwrap();
+        let result = f
+            .call("codex_cua_js", json!({"code":"must not run"}), "a")
+            .await;
+        assert!(result.is_error);
+        assert!(result.joined_text().contains("no UI operation was run"));
+        assert!(
+            !f.requests()
+                .iter()
+                .any(|r| r["method"] == "mcpServer/tool/call")
+        );
+        let app = default_config(f.directory.path().to_path_buf());
+        let rescue = crate::tools::exec_command::ExecCommand
+            .call(
+                json!({"cmd":"echo RESCUE_OK","yield_time_ms":1000}),
+                &app,
+                &SessionState::new(),
+            )
+            .await;
+        assert!(!rescue.is_error, "{}", rescue.joined_text());
+        assert!(rescue.joined_text().contains("RESCUE_OK"));
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "opens only Font Book in two caller-owned native services, takes screenshots, then immediately ends both"]
+    async fn installed_native_active_end_releases_both_isolated_captures() {
+        use std::os::unix::fs::MetadataExt;
+        let config =
+            std::env::var("CODEX_APP_SERVER_TEST_CONFIG").expect("private configuration required");
+        let app = default_config(std::env::current_dir().unwrap());
+        let adapter = AppServerBridge::new(
+            &McpServerSpec {
+                app_server: Some(AppServerConfig {
+                    config_file: Some(config),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &app,
+        )
+        .unwrap();
+        let _guard = adapter.guard();
+        async fn call(
+            adapter: &Arc<AppServerBridge>,
+            owner: &str,
+            tool: &str,
+            args: Value,
+        ) -> ToolResult {
+            let mut p = CallToolRequestParams::new(tool.to_string())
+                .with_arguments(args.as_object().unwrap().clone());
+            p.meta = Some(serde_json::from_value(json!({"codex-free/call-owner":owner})).unwrap());
+            adapter.call(p, None).await
+        }
+        async fn native(adapter: &Arc<AppServerBridge>, owner: &str) -> Value {
+            let session = adapter.test_session(owner).unwrap();
+            let conn = session.rpc.current().await.unwrap();
+            conn.native_ui.as_ref().unwrap().diagnostics().await
+        }
+        fn socket_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+            std::fs::symlink_metadata(path)
+                .ok()
+                .map(|m| (m.dev(), m.ino()))
+        }
+        let shared = PathBuf::from(std::env::var_os("HOME").unwrap()).join(
+            "Library/Group Containers/2DC432GLL2.com.openai.sky.CUAService/IPC/computeruse.sock",
+        );
+        let login =
+            PathBuf::from("/tmp/com.openai.sky.CUAService/LockScreenLoginAuthorization.sock");
+        let baseline = (socket_identity(&shared), socket_identity(&login));
+        println!(
+            "native-live start {} shared={baseline:?}",
+            chrono::Utc::now()
+        );
+        let mut observations = Vec::new();
+        for owner in ["native-live-a", "native-live-b"] {
+            let result=call(&adapter,owner,"codex_cua_js",json!({"code":"var freeNativeCapture = await cua.getApp('com.apple.FontBook');","timeout_ms":15000})).await;
+            assert!(!result.is_error, "{}", result.joined_text());
+            let screenshot = call(
+                &adapter,
+                owner,
+                "codex_cua_js",
+                json!({"code":"await freeNativeCapture.getScreenshot();","timeout_ms":15000}),
+            )
+            .await;
+            assert!(!screenshot.is_error, "{}", screenshot.joined_text());
+            assert!(
+                screenshot
+                    .content
+                    .iter()
+                    .any(|c| matches!(c, crate::types::ToolContent::Image { .. })),
+                "actual screenshot not returned"
+            );
+            observations.push(native(&adapter, owner).await);
+            println!(
+                "native-live {owner} captured {} {}",
+                chrono::Utc::now(),
+                observations.last().unwrap()
+            );
+        }
+        let a = observations[0]["pid"].as_u64().unwrap() as u32;
+        let b = observations[1]["pid"].as_u64().unwrap() as u32;
+        assert_ne!(a, b);
+        let start = std::time::Instant::now();
+        let ended_a = call(&adapter, "native-live-a", "codex_ui_session_end", json!({})).await;
+        println!(
+            "native-live ended A {} {}",
+            chrono::Utc::now(),
+            ended_a.joined_text()
+        );
+        assert!(!ended_a.is_error, "{}", ended_a.joined_text());
+        assert!(!alive(a));
+        assert!(alive(b));
+        let still = call(
+            &adapter,
+            "native-live-b",
+            "codex_cua_js",
+            json!({"code":"await freeNativeCapture.getScreenshot();","timeout_ms":15000}),
+        )
+        .await;
+        assert!(!still.is_error, "{}", still.joined_text());
+        assert!(
+            still
+                .content
+                .iter()
+                .any(|c| matches!(c, crate::types::ToolContent::Image { .. }))
+        );
+        assert_eq!(native(&adapter, "native-live-b").await["pid"], b);
+        println!("native-live B still captured {}", chrono::Utc::now());
+        let ended_b = call(&adapter, "native-live-b", "codex_ui_session_end", json!({})).await;
+        println!(
+            "native-live ended B {} {}",
+            chrono::Utc::now(),
+            ended_b.joined_text()
+        );
+        assert!(!ended_b.is_error, "{}", ended_b.joined_text());
+        assert!(!alive(b));
+        assert_eq!(
+            baseline,
+            (socket_identity(&shared), socket_identity(&login))
+        );
+        if let Ok(path) = std::env::var("CODEX_APP_SERVER_NATIVE_TEST_RECEIPT") {
+            std::fs::write(path,serde_json::to_vec_pretty(&json!({"native":observations,"endedA":ended_a.structured_content,"endedB":ended_b.structured_content,"aEndThroughBEndMs":start.elapsed().as_millis(),"sharedEndpointsUnchanged":true,"bScreenshotAfterAEnd":true,"completedAt":chrono::Utc::now()})).unwrap()).unwrap();
+        }
+        println!(
+            "both native captures ended; B still returned a screenshot after A ended; shared endpoints unchanged"
+        );
     }
 
     #[tokio::test]
@@ -903,7 +1238,7 @@ for line in sys.stdin:
  elif method=='thread/unsubscribe':reply(i,{'status':'unsubscribed'})
  elif method=='mcpServerStatus/list':
   name=mode.get('toolName','first_tool')
-  reply(i,{'data':[{'name':'cua_repl','tools':{'js':{'name':'js'}}},{'name':'fixture','tools':{name:{'name':name,'description':'Runtime-discovered fixture tool','inputSchema':{'type':'object','properties':{'live':{'type':'boolean'}}}}}},{'name':'codex_apps','tools':{'demo':{'name':'demo','_meta':{'connector_id':'fixture-app','connector_name':'Fixture App'}}}}]})
+  reply(i,{'data':[{'name':'cua_repl','tools':{'js':{'name':'js'}}},{'name':'node_repl','tools':{'js':{'name':'js'}}},{'name':'fixture','tools':{name:{'name':name,'description':'Runtime-discovered fixture tool','inputSchema':{'type':'object','properties':{'live':{'type':'boolean'}}}}}},{'name':'codex_apps','tools':{'demo':{'name':'demo','_meta':{'connector_id':'fixture-app','connector_name':'Fixture App'}}}}]})
  elif method=='mcpServer/tool/call':
   tool=p.get('tool')
   if tool=='die':os._exit(17)

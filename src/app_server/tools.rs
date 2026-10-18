@@ -99,7 +99,12 @@ impl AppServerSession {
             "codex_mcp_oauth_login"=>Ok(text_result(self.request(&conn,"mcpServer/oauth/login",pick(args,&["name"])).await?)),
             "codex_cua_docs"|"codex_cua_state"|"codex_cua_js"=>{
                 let status=self.mcp_status(&conn,&json!({"detail":"toolsAndAuthOnly"})).await?;
-                let servers=data(&status);let server=["cua_repl","node_repl"].into_iter().find(|name|servers.iter().any(|s|s["name"]==*name))
+                let servers=data(&status);
+                let available=servers.iter().filter_map(|s|s["name"].as_str()).collect::<Vec<_>>();
+                let server=match &conn.native_ui {
+                    Some(native)=>native.repl(&available),
+                    None=>["cua_repl","node_repl"].into_iter().find(|name|available.contains(name)),
+                }
                     .ok_or_else(||RpcError::message("No trusted Computer Use runtime is available"))?;
                 let params=match name {
                     "codex_cua_docs"=>json!({"code":"nodeRepl.write(await cua.rewriteDocumentation())","title":"Read live Computer Use documentation"}),
@@ -163,14 +168,27 @@ impl AppServerSession {
         args: Value,
         metadata: bool,
     ) -> Result<Value, RpcError> {
-        let scope = self.utility(conn).await?;
         let is_repl = ["cua_repl", "node_repl"].contains(&server);
+        if is_repl
+            && conn
+                .native_ui
+                .as_ref()
+                .is_some_and(|native| !native.owns_repl(server))
+        {
+            return Err(RpcError::message(
+                "This virtual UI runtime is not caller-isolated; use codex_cua_js with the configured runtime",
+            ));
+        }
+        let scope = self.utility(conn).await?;
         if is_repl && tool == "turn_ended" {
             return Err(RpcError::message(
                 "Use codex_ui_session_end to release only this caller's session",
             ));
         }
         if is_repl {
+            if let Some(native) = &conn.native_ui {
+                native.ensure_started(&self.settings, conn.pid).await?;
+            }
             self.utility
                 .lock()
                 .await
@@ -197,7 +215,7 @@ impl AppServerSession {
         if p.get("detail").is_none() {
             p["detail"] = json!("toolsAndAuthOnly");
         }
-        match self.request(conn, "mcpServerStatus/list", p).await {
+        let mut value = match self.request(conn, "mcpServerStatus/list", p).await {
             Err(e)
                 if e.unsupported()
                     || e.rpc.as_ref().and_then(|v| v["code"].as_i64()) == Some(-32602) =>
@@ -206,14 +224,28 @@ impl AppServerSession {
                     .await
             }
             value => value,
+        }?;
+        if let Some(native) = &conn.native_ui
+            && let Some(servers) = value["data"].as_array_mut()
+        {
+            servers.retain(|server| {
+                server["name"].as_str().is_none_or(|name| {
+                    !["cua_repl", "node_repl"].contains(&name) || native.owns_repl(name)
+                })
+            });
         }
+        Ok(value)
     }
     async fn diagnostics(&self, conn: &Connection) -> Value {
+        let native = match &conn.native_ui {
+            Some(native) => native.diagnostics().await,
+            None => json!({"isolation":"not_applicable"}),
+        };
         let utility = self.utility.lock().await;
         let context = utility.as_ref().filter(|u| u.generation == conn.generation);
         json!({"adapter":"rust","cli":self.settings.cli,"workDir":self.settings.work_dir,"appServerRunning":conn.is_alive(),"appServerPid":conn.pid,
             "utilityThreadId":context.map(|u|&u.thread_id),"utilitySessionId":context.map(|u|&u.session_id),"syntheticTurnId":context.map(|u|&u.turn_id),
-            "modelTurnsStartedByBridge":0,"idleTimeoutMs":300000,"sessionIsolation":"caller-owned-process","stderrTail":conn.stderr.lock().unwrap().iter().rev().take(20).collect::<Vec<_>>()})
+            "modelTurnsStartedByBridge":0,"idleTimeoutMs":300000,"sessionIsolation":"caller-owned-process","nativeUi":native,"stderrTail":conn.stderr.lock().unwrap().iter().rev().take(20).collect::<Vec<_>>()})
     }
     async fn apps(&self, conn: &Connection, name: &str, args: &Value) -> Result<Value, RpcError> {
         let read = name == "codex_apps_read";

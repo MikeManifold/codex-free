@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod confirmations;
 mod lifecycle;
+mod native_ui;
 #[cfg(test)]
 mod tests;
 mod tools;
@@ -33,7 +34,7 @@ impl Drop for PendingCall {
     }
 }
 
-pub const VERSION: &str = "0.5.0";
+pub const VERSION: &str = "0.5.1";
 
 struct UtilityContext {
     generation: u64,
@@ -275,7 +276,7 @@ impl AppServerSession {
             );
         }
         confirmations::text_result(
-            json!({"ended":true,"alreadyEnded":false,"cleanup":"owned_runtime_stopped","warnings":warnings}),
+            json!({"ended":true,"alreadyEnded":false,"cleanup":"owned_runtime_stopped","nativeUiCleanup":self.rpc.native_cleanup_status().await,"warnings":warnings}),
         )
     }
     async fn close(&self) -> Value {

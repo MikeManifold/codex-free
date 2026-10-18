@@ -27,6 +27,8 @@ Existing `CODEX_APP_BRIDGE_CONFIG`, `CODEX_APP_CLI`, `CODEX_APP_BRIDGE_WORK_DIR`
 
 The 26 compatibility tools keep their names; `codex_ui_session_end` adds immediate caller-scoped cleanup. Upstream MCP tools are discovered at runtime: use `codex_mcp_status` to list names, add `serverName` and `toolName` to retrieve the exact live schema, then call `codex_mcp_call`. No provider-specific tool list is compiled into Free. Changes to the underlying App Server RPC protocol may still require an adapter update. With this adapter enabled, Free suppresses duplicate direct `cua_repl` and `node_repl` sources; use their runtime tools through App Server.
 
+On macOS, configure the installed official `node_repl` with its existing trusted CUA services in Codex's config. Free applies the official CUA bootstrap and a private native endpoint only to its owned App Server. The virtual shared `cua_repl` shortcut is excluded from the callable catalog; use `codex_cua_*` for UI work. Global Codex configuration and OS permissions are unchanged.
+
 ## Human confirmations
 
 A pending operation returns `awaiting_confirmation`, its operation ID and the actual form. Present that form to the human; pass their explicit decision to `codex_confirmation_respond`. Continue the original operation rather than repeating its call. `codex_confirmations_list` and `codex_operation_result` are isolated by Free's trusted caller identity. Results preserve native image blocks, metadata and errors.
@@ -38,6 +40,8 @@ Operations are serialized within each caller's independent runtime because upstr
 Consecutive calls from one trusted conversation reuse its runtime and variables. Different callers have separate processes, REPL variables, queues, and confirmation registries. After five idle minutes following the last completed call, Free sends the official `turn_ended` hook, unsubscribes the utility thread, and stops the owned runtime. Queued/running calls and pending confirmations prevent idle reclamation. RPC and confirmation timeouts remain bounded independently. This timer does not require another incoming request or a model-issued close call; MCP does not supply ChatGPT's turn-completed event.
 
 Call `codex_ui_session_end` with `{}` to end the current caller's session immediately. It also cancels this caller's pending operations, is idempotent, and never selects another caller's session. Cleanup failures return warnings and fall back to stopping that caller's owned process. A subsequent new call creates fresh state; old REPL variables and browser handles cannot be reused. Pending operations and UI variables are memory-only. After expiry, errors, cancellation, or restart, inspect external state before retrying a write. Never automatically replay the original operation.
+
+Native macOS capture uses a lazily started helper process and Unix socket per caller. Cleanup requests that exact process to terminate, waits for exit, and forcibly stops it if necessary; it never searches by process name or terminates the desktop's shared helper. A filesystem sandbox prevents the helper from replacing the desktop's public native/login sockets. Sessions and capture are isolated; the Mac's actual windows, pointer and keyboard are still shared.
 
 ## Recovery and tests
 

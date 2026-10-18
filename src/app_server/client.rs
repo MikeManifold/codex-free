@@ -83,6 +83,7 @@ pub(super) struct Connection {
     closed: CancellationToken,
     pub init: Value,
     pub stderr: Arc<Mutex<VecDeque<String>>>,
+    pub native_ui: Option<Arc<super::native_ui::NativeUi>>,
     extension: watch::Receiver<Option<Instant>>,
 }
 
@@ -190,9 +191,13 @@ impl RpcClient {
     pub async fn stop_owned(&self) -> bool {
         if let Some(conn) = self.connection.lock().await.as_ref() {
             conn.stop();
-            tokio::time::timeout(Duration::from_secs(5), conn.closed.cancelled())
+            tokio::time::timeout(Duration::from_secs(8), conn.closed.cancelled())
                 .await
                 .is_ok()
+                && match &conn.native_ui {
+                    Some(native) => native.stopped().await,
+                    None => true,
+                }
         } else {
             true
         }
@@ -205,12 +210,24 @@ impl RpcClient {
             .filter(|c| c.is_alive())
             .cloned()
     }
+    pub async fn native_cleanup_status(&self) -> &'static str {
+        let slot = self.connection.lock().await;
+        match slot.as_ref().and_then(|conn| conn.native_ui.as_ref()) {
+            Some(native) if native.stopped().await => "owned_service_stopped",
+            Some(_) => "failed",
+            None => "not_applicable",
+        }
+    }
     async fn start(&self) -> Result<Arc<Connection>, RpcError> {
+        let native_ui = super::native_ui::NativeUi::prepare(&self.settings)?;
         let mut command = Command::new(&self.settings.cli);
+        command.envs(&self.settings.env);
+        if let Some(native) = &native_ui {
+            native.configure(&mut command);
+        }
         command
             .args(["app-server", "--listen", "stdio://"])
             .current_dir(&self.settings.spawn_dir)
-            .envs(&self.settings.env)
             .env("CODEX_HOME", &self.settings.codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -248,6 +265,7 @@ impl RpcClient {
             closed: closed.clone(),
             init: Value::Null,
             stderr: stderr.clone(),
+            native_ui: native_ui.clone(),
             extension,
         };
         let writer_stop = stop.clone();
@@ -353,6 +371,9 @@ impl RpcClient {
             tokio::select! {
                 _=child.wait()=>{},
                 _=manager_stop.cancelled()=>{
+                    if let Some(native) = &native_ui {
+                        let _ = native.stop().await;
+                    }
                     #[cfg(unix)] unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
                     #[cfg(not(unix))] { let _=child.start_kill(); }
                     if tokio::time::timeout(Duration::from_secs(3),child.wait()).await.is_err() {
@@ -360,6 +381,9 @@ impl RpcClient {
                         let _=child.start_kill(); let _=child.wait().await;
                     }
                 }
+            }
+            if let Some(native) = native_ui {
+                let _ = native.stop().await;
             }
             alive.store(false, Ordering::SeqCst);
             manager_stop.cancel();

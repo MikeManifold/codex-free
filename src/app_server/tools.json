@@ -1,7 +1,7 @@
 [
   {
     "name": "codex_ui_session_end",
-    "description": "End only this caller's App Server and Computer Use session immediately. Releases browser/control claims and in-memory REPL variables, cancels this caller's pending operations, and stops its owned runtime. Other chats, desktop Codex, native Rust files/commands, and local_shell/exec are unaffected. Idempotent; a later new call creates fresh state. Otherwise the server reclaims this session after five idle minutes following the last completed call; running operations and pending confirmations are not idle. Do not replay a write or reuse stale browser handles after ending/expiration.",
+    "description": "End only this caller's App Server and Computer Use session immediately. Releases browser/control claims and in-memory REPL variables, cancels this caller's pending operations, and stops its owned runtime and macOS native capture helper. Other chats, desktop Codex, native Rust files/commands, and local_shell/exec are unaffected. Idempotent; a later new call creates fresh state. Otherwise the server reclaims this session after five idle minutes following the last completed call; running operations and pending confirmations are not idle. Do not replay a write or reuse stale browser handles after ending/expiration.",
     "inputSchema": {"type":"object","properties":{},"additionalProperties":false}
   },
   {
@@ -269,7 +269,7 @@
   },
   {
     "name": "codex_cua_js",
-    "description": "Execute JavaScript in the unified Computer Use runtime (cua_repl when available, otherwise the trusted node_repl runtime). Use codex_cua_state to discover available backends first. Chrome and native macOS control can work independently of a desktop in-app browser; do not substitute another backend after an access denial.",
+    "description": "Execute JavaScript in this caller's App Server Computer Use runtime. On macOS, Free selects the configured official node_repl with its private native capture helper. Use codex_cua_state to discover available backends first. Chrome and native macOS control can work independently of a desktop in-app browser; do not substitute another backend after an access denial.",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
