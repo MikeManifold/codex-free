@@ -84,7 +84,7 @@ impl AppServerBridge {
         AppServerSession::info()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn test_session(&self, owner: &str) -> Option<Arc<AppServerSession>> {
         self.sessions.lock().unwrap().get(owner).cloned()
     }
