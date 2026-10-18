@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::process_env::scrub_untrusted_child_env;
 use crate::project_bindings::ConversationIdentity;
@@ -235,10 +235,6 @@ pub enum ReviewAvailability {
     Unavailable(String),
 }
 
-pub struct ReviewMutationGuard {
-    _guard: OwnedMutexGuard<()>,
-}
-
 #[derive(Default)]
 pub struct ReviewCheckpointManager {
     locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -259,19 +255,6 @@ impl ReviewCheckpointManager {
         let lock = self.scope_lock(&owner.lock_key(&workspace_key));
         let _guard = lock.lock().await;
         Self::ensure_initialized_locked(config, &owner, project_root).await
-    }
-
-    pub async fn begin_mutation(
-        &self,
-        config: &AppConfig,
-        owner: ReviewOwner,
-    ) -> Result<(ReviewAvailability, ReviewMutationGuard), String> {
-        let project_root = canonical_project_root(&config.work_dir)?;
-        let workspace_key = hash_path(&project_root);
-        let lock = self.scope_lock(&owner.lock_key(&workspace_key));
-        let guard = lock.lock_owned().await;
-        let availability = Self::ensure_initialized_locked(config, &owner, project_root).await?;
-        Ok((availability, ReviewMutationGuard { _guard: guard }))
     }
 
     async fn ensure_initialized_locked(

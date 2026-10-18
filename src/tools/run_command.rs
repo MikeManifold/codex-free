@@ -52,10 +52,6 @@ impl Tool for RunCommand {
         }))
     }
 
-    fn may_modify_project(&self) -> bool {
-        true
-    }
-
     async fn call(&self, args: Value, config: &AppConfig, _session: &SessionState) -> ToolResult {
         let Some(command) = arg_str(&args, "command") else {
             return ToolResult::error("command must be a string");

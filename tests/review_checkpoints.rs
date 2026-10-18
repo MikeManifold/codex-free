@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use codex_free::config::default_config;
 use codex_free::project_bindings::ConversationIdentity;
@@ -224,41 +223,6 @@ async fn deleting_persistent_refs_reinitializes_a_live_manager() {
         .unwrap();
     assert_eq!(result.summary.files, 1);
     assert!(result.patch.contains("+after"));
-}
-
-#[tokio::test]
-async fn mutation_guard_serializes_review_for_the_same_scope() {
-    let repo = init_repo();
-    std::fs::write(repo.path().join("file.txt"), "before\n").unwrap();
-    commit_all(repo.path(), "seed");
-    let config = default_config(repo.path().to_path_buf());
-    let manager = ReviewCheckpointManager::new();
-    let owner = conversation("serialized-review");
-
-    let (_, guard) = manager
-        .begin_mutation(&config, owner.clone())
-        .await
-        .unwrap();
-    let blocked = tokio::time::timeout(
-        Duration::from_millis(50),
-        manager.show_changes(
-            &config,
-            owner.clone(),
-            request(ReviewBaseline::ProjectOpen, false),
-        ),
-    )
-    .await;
-    assert!(blocked.is_err());
-
-    drop(guard);
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        manager.show_changes(&config, owner, request(ReviewBaseline::ProjectOpen, false)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(result.summary.files, 0);
 }
 
 #[tokio::test]

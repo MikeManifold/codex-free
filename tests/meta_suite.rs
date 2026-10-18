@@ -227,28 +227,6 @@ fn show_changes_links_the_review_mcp_app() {
     assert!(tool.output_schema().is_none());
 }
 
-#[test]
-fn mutating_tools_are_classified_for_checkpoint_fail_closed_behavior() {
-    let mut names = load_tools()
-        .into_iter()
-        .filter(|tool| tool.may_modify_project())
-        .map(|tool| tool.name().to_string())
-        .collect::<Vec<_>>();
-    names.sort();
-    assert_eq!(
-        names,
-        [
-            "apply_patch".to_string(),
-            "exec_command".to_string(),
-            "git_commit".to_string(),
-            "import_host_file".to_string(),
-            "run_command".to_string(),
-            "write_file".to_string(),
-            "write_stdin".to_string(),
-        ]
-    );
-}
-
 // ─── structured-content.test.ts ────────────────────────────────────────
 //
 // There is no free `withStructuredContent` function in Rust; the default-fill

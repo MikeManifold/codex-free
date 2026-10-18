@@ -47,7 +47,7 @@ use crate::output_budget::{
 };
 use crate::project_bindings::{ConversationIdentity, ProjectBindingStore};
 use crate::registry::load_tools_for_config;
-use crate::review::{ReviewAvailability, ReviewCheckpointManager, ReviewOwner};
+use crate::review::ReviewCheckpointManager;
 use crate::review_ui;
 use crate::tool::{Tool, ToolCallIdentity, ToolRequestContext};
 use crate::tool_logging::ToolCallLogger;
@@ -444,69 +444,8 @@ impl ServerHandler for CodexHandler {
                     match resolved {
                         Err(error) => ToolResult::error(error),
                         Ok(effective_config) => {
-                            let owner = match conversation.as_ref() {
-                                Some(identity) => ReviewOwner::conversation(identity),
-                                None => ReviewOwner::transport(self.session.review_state()),
-                            };
-                            if execution_policy.is_some_and(|p| p.may_modify_project) {
-                                // Fail closed: refuse a mutating tool when the review
-                                // checkpoint cannot be captured. The refusal is returned
-                                // as a value (not an early return) so the audit
-                                // finish_tool below still pairs with begin_tool.
-                                match self
-                                    .review_checkpoints
-                                    .begin_mutation(&effective_config, owner)
-                                    .await
-                                {
-                                    Ok((availability, guard)) => {
-                                        if let ReviewAvailability::Unavailable(reason) =
-                                            &availability
-                                        {
-                                            tracing::debug!(
-                                                "review checkpoints unavailable for {name}: {reason}"
-                                            );
-                                        }
-                                        let result = tool
-                                            .call_with_context(
-                                                args,
-                                                &effective_config,
-                                                session,
-                                                &tool_context,
-                                            )
-                                            .await;
-                                        drop(guard);
-                                        result
-                                    }
-                                    Err(error) => ToolResult::error(format!(
-                                        "Refusing to run mutating tool `{name}` because the project review checkpoint could not be captured: {error}"
-                                    )),
-                                }
-                            } else {
-                                match self
-                                    .review_checkpoints
-                                    .ensure_initialized(&effective_config, owner)
-                                    .await
-                                {
-                                    Ok(ReviewAvailability::Ready) => {}
-                                    Ok(ReviewAvailability::Unavailable(reason)) => {
-                                        tracing::debug!(
-                                            "review checkpoints unavailable for {name}: {reason}"
-                                        );
-                                    }
-                                    Err(error) => {
-                                        tracing::debug!(
-                                            "review checkpoint initialization skipped for {name}: {error}"
-                                        );
-                                    }
-                                }
-                                tool.call_with_context(
-                                    args,
-                                    &effective_config,
-                                    session,
-                                    &tool_context,
-                                )
+                            tool.call_with_context(args, &effective_config, session, &tool_context)
                                 .await
-                            }
                         }
                     }
                 }
@@ -1232,6 +1171,149 @@ mod tests {
         request.meta =
             Some(serde_json::from_value(json!({"openai/session": conversation})).unwrap());
         request
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_tools_never_snapshot_git_even_with_unborn_children_or_broken_config() {
+        for conversation in [false, true] {
+            for broken_config in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let project = root.path().join("project");
+                let nested = project.join("unborn");
+                std::fs::create_dir_all(&nested).unwrap();
+                for directory in [&project, &nested] {
+                    assert!(
+                        std::process::Command::new("git")
+                            .args(["init", "--quiet"])
+                            .current_dir(directory)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
+                }
+                if broken_config {
+                    std::fs::write(project.join(".git/config"), "[invalid\n").unwrap();
+                }
+                std::fs::write(project.join("read.txt"), "read first\n").unwrap();
+                let git_state = || {
+                    let mut files = Vec::new();
+                    for directory in [&project, &nested] {
+                        for entry in walkdir::WalkDir::new(directory.join(".git")) {
+                            let entry = entry.unwrap();
+                            if entry.file_type().is_file() {
+                                files.push((
+                                    entry.path().to_owned(),
+                                    std::fs::read(entry.path()).unwrap(),
+                                ));
+                            }
+                        }
+                    }
+                    files.sort();
+                    files
+                };
+                let before = git_state();
+                let mut tools = crate::registry::load_tools_for_mode(true);
+                tools.extend(crate::mcp_catalog::build_catalog_tools(Vec::new()));
+                let mut handler =
+                    handler_with_tools(&project, tools, crate::types::ToolLogLevel::Info);
+                // This regression exercises dispatch, not tracing subscribers.
+                handler.tool_logging = None;
+                handler.audit = None;
+                let config = Arc::make_mut(&mut handler.config);
+                config.multi_project = true;
+                config.exec.mode = crate::types::ExecMode::Unrestricted;
+                config.skills.enabled = Some(false);
+                config.allowed_commands.push("mkdir".into());
+                let request = |name: &str, arguments: Value| {
+                    if conversation {
+                        fallback_test_request(name, "no-auto-checkpoint", arguments)
+                    } else {
+                        CallToolRequestParams::new(name.to_owned())
+                            .with_arguments(arguments.as_object().unwrap().clone())
+                    }
+                };
+                let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+                let server =
+                    tokio::spawn(
+                        async move { handler.serve(server_io).await.unwrap().waiting().await },
+                    );
+                let client = ().serve(client_io).await.unwrap();
+                for (name, args) in [
+                    ("set_project_root", json!({"path":"."})),
+                    ("read_file", json!({"path":"read.txt"})),
+                    (
+                        "write_file",
+                        json!({"path":"written/new.txt","content":"written\n"}),
+                    ),
+                    (
+                        "apply_patch",
+                        json!({"input":"*** Begin Patch\n*** Add File: patched.txt\n+patched\n*** End Patch"}),
+                    ),
+                    (
+                        "exec_command",
+                        json!({"cmd":"mkdir from-exec","yield_time_ms":1000}),
+                    ),
+                    (
+                        "run_command",
+                        json!({"command":"mkdir","args":["from-run"]}),
+                    ),
+                    (
+                        "mcp_call_tool",
+                        json!({"source":"local_shell","tool":"exec","arguments":{"cmd":"mkdir from-alias","yield_time_ms":1000}}),
+                    ),
+                ] {
+                    let result = client.call_tool(request(name, args)).await.unwrap();
+                    assert_eq!(result.is_error, Some(false), "{name}: {result:?}");
+                }
+                let started = client
+                    .call_tool(request(
+                        "exec_command",
+                        json!({
+                            "cmd":"read -r value && printf '%s' \"$value\" > continued.txt",
+                            "yield_time_ms":250
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(started.is_error, Some(false), "{started:?}");
+                let id = started.structured_content.as_ref().unwrap()["session_id"]
+                    .as_u64()
+                    .unwrap();
+                let continued = client
+                    .call_tool(request(
+                        "write_stdin",
+                        json!({
+                            "session_id":id,"chars":"continued\n","yield_time_ms":1000
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(continued.is_error, Some(false), "{continued:?}");
+                assert_eq!(
+                    std::fs::read_to_string(project.join("continued.txt")).unwrap(),
+                    "continued"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(project.join("written/new.txt")).unwrap(),
+                    "written\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(project.join("patched.txt")).unwrap(),
+                    "patched\n"
+                );
+                for directory in ["from-exec", "from-run", "from-alias"] {
+                    assert!(project.join(directory).is_dir());
+                }
+                assert_eq!(
+                    git_state(),
+                    before,
+                    "ordinary calls must not create Git objects, refs, or an index"
+                );
+                client.cancel().await.unwrap();
+                server.await.unwrap().unwrap();
+            }
+        }
     }
 
     #[cfg(unix)]

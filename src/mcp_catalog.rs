@@ -1375,7 +1375,6 @@ impl Tool for McpCallToolTool {
             _ => crate::tool::ToolExecutionPolicy {
                 requires_project_root: false,
                 uses_exec_session_state: false,
-                may_modify_project: false,
             },
         }
     }
@@ -1434,27 +1433,19 @@ mod tests {
     }
 
     #[test]
-    fn local_shell_inherits_native_project_checkpoint_and_session_policy() {
+    fn local_shell_inherits_native_project_and_session_policy() {
         let tool = McpCallToolTool {
             catalog: Arc::new(Catalog::new(Vec::new())),
         };
         let policy = tool.execution_policy(&json!({"source":"local_shell", "tool":"exec"}));
         assert_eq!(policy, ExecCommand.execution_policy(&Value::Null));
-        assert!(
-            policy.requires_project_root
-                && policy.may_modify_project
-                && policy.uses_exec_session_state
-        );
+        assert!(policy.requires_project_root && policy.uses_exec_session_state);
         let remote = tool.execution_policy(&json!({"source":"other", "tool":"exec"}));
-        assert!(
-            !remote.requires_project_root
-                && !remote.may_modify_project
-                && !remote.uses_exec_session_state
-        );
+        assert!(!remote.requires_project_root && !remote.uses_exec_session_state);
         let invalid = tool.execution_policy(&json!({"source":"local_shell", "tool":"missing"}));
         assert!(!invalid.uses_exec_session_state);
         let ui = tool.execution_policy(&json!({"source":"local_ui", "tool":"render_html"}));
-        assert!(ui.requires_project_root && !ui.may_modify_project);
+        assert!(ui.requires_project_root);
     }
 
     #[tokio::test]

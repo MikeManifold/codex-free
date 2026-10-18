@@ -79,7 +79,7 @@ impl Tool for ShowChanges {
     }
 
     fn description(&self) -> String {
-        "Present project-scoped working-tree changes against the immutable project-open checkpoint or the incremental last-review checkpoint. The interactive widget receives tracked, untracked, deleted, renamed, executable, symlink, and binary changes through component-only result metadata without adding the patch to model-visible structured content. By default the returned review advances the last-review checkpoint, so call once after a related batch of edits rather than after every file. Set advance=false for a read-only comparison."
+        "Optional Git checkpoint review, only on explicit user request. If no checkpoint exists, this call establishes the baseline at the current state. Present project-scoped working-tree changes against the immutable project-open checkpoint or the incremental last-review checkpoint. The interactive widget receives tracked, untracked, deleted, renamed, executable, symlink, and binary changes through component-only result metadata without adding the patch to model-visible structured content. By default the returned review advances the last-review checkpoint, so call once after a related batch of edits rather than after every file. Set advance=false for a read-only comparison."
             .to_string()
     }
 

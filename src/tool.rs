@@ -31,12 +31,11 @@ pub struct ToolRequestContext {
 }
 
 /// Per-call execution requirements. A catalog dispatcher may delegate to a
-/// native tool, whose project/checkpoint/session requirements must be retained.
+/// native tool, whose project and command-session requirements must be retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolExecutionPolicy {
     pub requires_project_root: bool,
     pub uses_exec_session_state: bool,
-    pub may_modify_project: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,17 +155,10 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// Whether dispatch must fail closed if the initial review checkpoint cannot
-    /// be captured for a Git project.
-    fn may_modify_project(&self) -> bool {
-        false
-    }
-
     fn execution_policy(&self, _args: &Value) -> ToolExecutionPolicy {
         ToolExecutionPolicy {
             requires_project_root: self.requires_project_root(),
             uses_exec_session_state: self.uses_exec_session_state(),
-            may_modify_project: self.may_modify_project(),
         }
     }
 
