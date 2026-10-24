@@ -96,7 +96,28 @@ impl AppServerSession {
                 };
                 self.call_mcp(&conn,server,tool,arguments,false).await
             }
-            "codex_mcp_oauth_login"=>Ok(text_result(self.request(&conn,"mcpServer/oauth/login",pick(args,&["name"])).await?)),
+            "codex_mcp_oauth_login"=>{
+                let name=args["name"].as_str().filter(|s|!s.is_empty()).ok_or_else(||RpcError::message("name is required"))?;
+                let timeout=self.settings.oauth_timeout;
+                if !self.rpc.oauth.begin(conn.generation,name,timeout+self.settings.request_timeout) {
+                    return Err(RpcError::message("An OAuth login is already pending; no duplicate login was started"));
+                }
+                let p=json!({"name":name,"timeoutSecs":timeout.as_secs().max(1)});
+                match self.request(&conn,"mcpServer/oauth/login",p).await {
+                    Ok(value)=>{
+                        self.rpc.oauth.waiting(conn.generation,name,value["loginId"].as_str(),timeout);
+                        Ok(text_result(value))
+                    }
+                    Err(error)=>{
+                        // An explicit RPC rejection is definitive. A transport
+                        // timeout may have left a live callback: retain the
+                        // bounded wait and never replay the login automatically.
+                        if error.rpc.is_some() {self.rpc.oauth.release(conn.generation,name);}
+                        else {self.rpc.oauth.response_unknown(conn.generation,name);}
+                        Err(error)
+                    }
+                }
+            },
             "codex_cua_docs"|"codex_cua_state"|"codex_cua_js"=>{
                 let status=self.mcp_status(&conn,&json!({"detail":"toolsAndAuthOnly"})).await?;
                 let servers=data(&status);
@@ -154,6 +175,7 @@ impl AppServerSession {
             }
             "codex_rpc"=>{
                 let method=args["method"].as_str().ok_or_else(||RpcError::message("method is required"))?;
+                if method=="mcpServer/oauth/login" {return Err(RpcError::message("Use codex_mcp_oauth_login so the caller's authorization lifetime is tracked"));}
                 if !self.settings.allow_raw_rpc && !SAFE_RPC.contains(&method){return Err(RpcError::message(format!("RPC method is not allowlisted: {method}")));}
                 Ok(text_result(self.request(&conn,method,args.get("params").cloned().unwrap_or_else(||json!({}))).await?))
             }
@@ -245,7 +267,7 @@ impl AppServerSession {
         let context = utility.as_ref().filter(|u| u.generation == conn.generation);
         json!({"adapter":"rust","cli":self.settings.cli,"workDir":self.settings.work_dir,"appServerRunning":conn.is_alive(),"appServerPid":conn.pid,
             "utilityThreadId":context.map(|u|&u.thread_id),"utilitySessionId":context.map(|u|&u.session_id),"syntheticTurnId":context.map(|u|&u.turn_id),
-            "modelTurnsStartedByBridge":0,"idleTimeoutMs":300000,"sessionIsolation":"caller-owned-process","nativeUi":native,"stderrTail":conn.stderr.lock().unwrap().iter().rev().take(20).collect::<Vec<_>>()})
+            "modelTurnsStartedByBridge":0,"idleTimeoutMs":300000,"sessionIsolation":"caller-owned-process","nativeUi":native,"oauth":self.rpc.oauth.diagnostics(),"stderrTail":conn.stderr.lock().unwrap().iter().rev().take(20).collect::<Vec<_>>()})
     }
     async fn apps(&self, conn: &Connection, name: &str, args: &Value) -> Result<Value, RpcError> {
         let read = name == "codex_apps_read";

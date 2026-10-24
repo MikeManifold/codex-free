@@ -15,6 +15,7 @@ pub struct AppServerConfig {
     pub codex_home: Option<String>,
     pub request_timeout_ms: Option<u64>,
     pub confirmation_timeout_ms: Option<u64>,
+    pub oauth_timeout_ms: Option<u64>,
     pub allow_raw_rpc: Option<bool>,
 }
 
@@ -26,6 +27,7 @@ pub(super) struct Settings {
     pub spawn_dir: PathBuf,
     pub request_timeout: Duration,
     pub confirmation_timeout: Duration,
+    pub oauth_timeout: Duration,
     pub allow_raw_rpc: bool,
     pub env: HashMap<String, String>,
     pub removed_env: Vec<String>,
@@ -72,6 +74,7 @@ impl AppServerConfig {
             codex_home,
             request_timeout_ms,
             confirmation_timeout_ms,
+            oauth_timeout_ms,
             allow_raw_rpc
         );
         if merged.version.is_some_and(|v| v != 1) {
@@ -118,6 +121,7 @@ impl AppServerConfig {
             spawn_dir,
             request_timeout: timeout(request_ms, 120_000)?,
             confirmation_timeout: timeout(merged.confirmation_timeout_ms, 300_000)?,
+            oauth_timeout: timeout(merged.oauth_timeout_ms, 600_000)?,
             allow_raw_rpc: lookup("CODEX_APP_BRIDGE_ALLOW_RAW_RPC")
                 .map(|s| s == "1")
                 .unwrap_or(merged.allow_raw_rpc.unwrap_or(false)),

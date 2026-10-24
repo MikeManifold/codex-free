@@ -721,12 +721,21 @@ pub async fn start_http_server(mut config: AppConfig) -> anyhow::Result<()> {
     if !native_tunnel {
         println!("\nAdd to ChatGPT > Plugins > New Plugin:");
         println!("  Server URL: https://<your-tunnel>/mcp\n");
-        axum::serve(listener, app).await?;
-        return Ok(());
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await;
+        for service in &_app_server_services {
+            service.drain().await;
+        }
+        return result.map_err(Into::into);
     }
 
     println!("Exposure: loopback only; starting OpenAI Secure MCP Tunnel");
-    run_with_openai_tunnel(listener, app, config, mcp_cancellation).await
+    let result = run_with_openai_tunnel(listener, app, config, mcp_cancellation).await;
+    for service in &_app_server_services {
+        service.drain().await;
+    }
+    result
 }
 
 /// What ended a supervision cycle for a running tunnel. Terminal events (server

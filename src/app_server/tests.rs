@@ -1065,6 +1065,160 @@ signal.pause()
     }
 
     #[tokio::test]
+    async fn oauth_wait_survives_idle_other_calls_and_completes_without_relogin() {
+        let f = Fixture::new();
+        f.configure(json!({"oauthCompleteAfterMs":350}));
+        assert!(
+            !f.call("codex_mcp_oauth_login", json!({"name":"ibkr"}), "a")
+                .await
+                .is_error
+        );
+        let before = f.requests().len();
+        assert!(f.call("codex_mcp_status", json!({}), "a").await.is_error);
+        assert!(
+            f.call("codex_mcp_oauth_login", json!({"name":"ibkr"}), "a")
+                .await
+                .is_error
+        );
+        let status = f.call("codex_app_status", json!({}), "a").await;
+        assert_eq!(
+            status.structured_content.unwrap()["authorization"]["pending"],
+            true
+        );
+        assert_eq!(
+            f.requests().len(),
+            before,
+            "Pending login must not probe a rejected grant"
+        );
+        f.adapter
+            .reap_idle(
+                tokio::time::Instant::now() + Duration::from_secs(301),
+                lifecycle::IDLE_TIMEOUT,
+            )
+            .await;
+        assert!(!f.call("codex_mcp_status", json!({}), "b").await.is_error);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(!f.call("codex_mcp_status", json!({}), "a").await.is_error);
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "mcpServer/oauth/login")
+                .count(),
+            1
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            2
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .find(|r| r["method"] == "mcpServer/oauth/login")
+                .unwrap()["params"]["timeoutSecs"],
+            600
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_rpc_timeout_retains_callback_until_completion() {
+        let f = Fixture::new();
+        f.configure(json!({"oauthReplyDelayMs":1300,"oauthCompleteAfterMs":1700}));
+        assert!(
+            f.call("codex_mcp_oauth_login", json!({"name":"ibkr"}), "a")
+                .await
+                .is_error
+        );
+        let status = f.call("codex_app_status", json!({}), "a").await;
+        assert_eq!(
+            status.structured_content.unwrap()["authorization"]["pending"],
+            true
+        );
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!f.call("codex_mcp_status", json!({}), "a").await.is_error);
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "mcpServer/oauth/login")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn host_shutdown_waits_for_owned_child_eof_commit() {
+        let f = Fixture::new();
+        assert!(!f.call("codex_mcp_status", json!({}), "a").await.is_error);
+        assert!(!f.call("codex_mcp_status", json!({}), "b").await.is_error);
+        f.configure(json!({"eofCommitMs":350}));
+        f._guard.drain().await;
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "fixture/eofCommit")
+                .count(),
+            2
+        );
+        assert!(f.call("codex_mcp_status", json!({}), "a").await.is_error);
+    }
+
+    #[tokio::test]
+    async fn oauth_completion_before_response_and_explicit_end_are_safe() {
+        let f = Fixture::new();
+        f.configure(json!({"oauthImmediate":true}));
+        assert!(
+            !f.call("codex_mcp_oauth_login", json!({"name":"ibkr"}), "a")
+                .await
+                .is_error
+        );
+        assert!(!f.call("codex_mcp_status", json!({}), "a").await.is_error);
+        f.configure(json!({}));
+        assert!(
+            !f.call("codex_mcp_oauth_login", json!({"name":"ibkr"}), "a")
+                .await
+                .is_error
+        );
+        assert!(
+            !f.call("codex_ui_session_end", json!({}), "a")
+                .await
+                .is_error
+        );
+        assert!(!f.call("codex_mcp_status", json!({}), "a").await.is_error);
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "initialize")
+                .count(),
+            2
+        );
+        assert!(
+            f.call(
+                "codex_rpc",
+                json!({"method":"mcpServer/oauth/login","params":{"name":"ibkr"}}),
+                "a"
+            )
+            .await
+            .is_error
+        );
+        assert_eq!(
+            f.requests()
+                .iter()
+                .filter(|r| r["method"] == "mcpServer/oauth/login")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn idle_deadline_is_five_minutes_after_completion_and_is_renewed() {
         let f = Fixture::new();
         let started = tokio::time::Instant::now();
@@ -1214,7 +1368,7 @@ signal.pause()
     }
 
     const FIXTURE: &str = r##"#!/usr/bin/env python3
-import sys,json,os,time,base64
+import sys,json,os,time,base64,threading
 log=os.environ['FIXTURE_LOG'];modefile=os.environ['FIXTURE_MODE'];pending={};formid=10000;threads=0
 def send(v):print(json.dumps(v),flush=True)
 def reply(i,v):send({'id':i,'result':v})
@@ -1233,6 +1387,12 @@ for line in sys.stdin:
   reply(original,{'data':[]} if directory else result({'accepted':approved}));continue
  if i is None:continue
  if method=='initialize':reply(i,{})
+ elif method=='mcpServer/oauth/login':
+  done={'method':'mcpServer/oauthLogin/completed','params':{'name':p['name'],'loginId':'owned-login','success':True}}
+  if mode.get('oauthImmediate'):send(done)
+  elif mode.get('oauthCompleteAfterMs'):threading.Timer(mode['oauthCompleteAfterMs']/1000,lambda v=done:send(v)).start()
+  if mode.get('oauthReplyDelayMs'):time.sleep(mode['oauthReplyDelayMs']/1000)
+  reply(i,{'authorizationUrl':'https://example.invalid/owned-fixture','loginId':'owned-login'})
  elif method=='thread/start':
   threads+=1;reply(i,{'thread':{'id':f'fixture-{os.getpid()}-{threads}','sessionId':f'session-{os.getpid()}'}})
  elif method=='thread/unsubscribe':reply(i,{'status':'unsubscribed'})
@@ -1252,5 +1412,9 @@ for line in sys.stdin:
   elif mode.get('directoryConfirm'):form(i,directory=True)
   else:send({'id':i,'error':{'code':-32601,'message':'Unknown method'}})
  else:send({'id':i,'error':{'code':-32601,'message':'Unexpected or model-turn RPC: '+method}})
+mode=json.load(open(modefile))
+if mode.get('eofCommitMs'):
+ time.sleep(mode['eofCommitMs']/1000)
+ with open(log,'a') as f:f.write(json.dumps({'method':'fixture/eofCommit'})+'\n')
 "##;
 }

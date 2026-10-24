@@ -85,6 +85,7 @@ pub(super) struct Connection {
     pub stderr: Arc<Mutex<VecDeque<String>>>,
     pub native_ui: Option<Arc<super::native_ui::NativeUi>>,
     extension: watch::Receiver<Option<Instant>>,
+    oauth: Arc<super::oauth::OAuthWaits>,
 }
 
 impl Connection {
@@ -138,6 +139,7 @@ impl Connection {
         if result
             .as_ref()
             .is_err_and(|e| e.message.starts_with("App Server RPC timed out:"))
+            && !(method == "mcpServer/oauth/login" && self.oauth.has_flows())
         {
             self.stop();
         }
@@ -152,6 +154,7 @@ impl Drop for Connection {
 }
 
 pub(super) struct RpcClient {
+    pub oauth: Arc<super::oauth::OAuthWaits>,
     settings: Settings,
     connection: tokio::sync::Mutex<Option<Arc<Connection>>>,
     generation: AtomicU64,
@@ -162,6 +165,7 @@ pub(super) struct RpcClient {
 impl RpcClient {
     pub fn new(settings: Settings, handler: RequestHandler) -> Self {
         Self {
+            oauth: Arc::new(Default::default()),
             settings,
             handler,
             connection: tokio::sync::Mutex::new(None),
@@ -182,7 +186,14 @@ impl RpcClient {
         }
         if let Some(conn) = slot.take() {
             conn.stop();
-            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed.cancelled()).await;
+            if tokio::time::timeout(Duration::from_secs(140), conn.closed.cancelled())
+                .await
+                .is_err()
+            {
+                return Err(RpcError::message(
+                    "Previous owned App Server is still draining; no replacement was started",
+                ));
+            }
         }
         let conn = self.start().await?;
         *slot = Some(conn.clone());
@@ -191,7 +202,7 @@ impl RpcClient {
     pub async fn stop_owned(&self) -> bool {
         if let Some(conn) = self.connection.lock().await.as_ref() {
             conn.stop();
-            tokio::time::timeout(Duration::from_secs(8), conn.closed.cancelled())
+            tokio::time::timeout(Duration::from_secs(140), conn.closed.cancelled())
                 .await
                 .is_ok()
                 && match &conn.native_ui {
@@ -226,7 +237,13 @@ impl RpcClient {
             native.configure(&mut command);
         }
         command
-            .args(["app-server", "--listen", "stdio://"])
+            .args([
+                "--enable",
+                "mcp_oauth_refresh_coordination",
+                "app-server",
+                "--listen",
+                "stdio://",
+            ])
             .current_dir(&self.settings.spawn_dir)
             .env("CODEX_HOME", &self.settings.codex_home)
             .stdin(Stdio::piped())
@@ -267,6 +284,7 @@ impl RpcClient {
             stderr: stderr.clone(),
             native_ui: native_ui.clone(),
             extension,
+            oauth: self.oauth.clone(),
         };
         let writer_stop = stop.clone();
         tokio::spawn(async move {
@@ -282,6 +300,8 @@ impl RpcClient {
         });
         let reader_stop = stop.clone();
         let reader_pending = pending.clone();
+        let reader_oauth = self.oauth.clone();
+        let generation = conn.generation;
         let handler = self.handler.clone();
         let extension_duration = self.settings.confirmation_timeout + self.settings.request_timeout;
         tokio::spawn(async move {
@@ -299,6 +319,9 @@ impl RpcClient {
                     continue;
                 };
                 if message.get("id").is_none() {
+                    if message["method"] == "mcpServer/oauthLogin/completed" {
+                        reader_oauth.completed(generation, &message["params"]);
+                    }
                     continue;
                 }
                 if message.get("result").is_some()
@@ -367,6 +390,7 @@ impl RpcClient {
             }
         });
         let manager_stop = stop.clone();
+        let manager_oauth = self.oauth.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _=child.wait()=>{},
@@ -374,11 +398,15 @@ impl RpcClient {
                     if let Some(native) = &native_ui {
                         let _ = native.stop().await;
                     }
-                    #[cfg(unix)] unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
-                    #[cfg(not(unix))] { let _=child.start_kill(); }
-                    if tokio::time::timeout(Duration::from_secs(3),child.wait()).await.is_err() {
+                    // The writer drops stdin on cancellation. Let official Codex
+                    // finish an accepted refresh and its durable save before signals.
+                    if tokio::time::timeout(Duration::from_secs(130),child.wait()).await.is_err() {
+                        #[cfg(unix)] unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
+                        #[cfg(not(unix))] { let _=child.start_kill(); }
+                        if tokio::time::timeout(Duration::from_secs(3),child.wait()).await.is_err() {
                         #[cfg(unix)] unsafe { libc::kill(-(pid as i32),libc::SIGKILL); }
                         let _=child.start_kill(); let _=child.wait().await;
+                        }
                     }
                 }
             }
@@ -386,6 +414,7 @@ impl RpcClient {
                 let _ = native.stop().await;
             }
             alive.store(false, Ordering::SeqCst);
+            manager_oauth.runtime_exited(generation);
             manager_stop.cancel();
             for (_, reply) in pending.lock().unwrap().drain() {
                 let _ = reply.send(Err(RpcError::message(

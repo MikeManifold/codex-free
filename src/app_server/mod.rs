@@ -4,6 +4,7 @@ mod config;
 mod confirmations;
 mod lifecycle;
 mod native_ui;
+mod oauth;
 #[cfg(test)]
 mod tests;
 mod tools;
@@ -34,7 +35,7 @@ impl Drop for PendingCall {
     }
 }
 
-pub const VERSION: &str = "0.5.1";
+pub const VERSION: &str = "0.5.2";
 
 struct UtilityContext {
     generation: u64,
@@ -162,6 +163,28 @@ impl AppServerSession {
             }
             op.running();
             bridge.operations.set_active(Some(&op));
+            // A login URL is only the beginning of the operation. While the
+            // caller is authorizing, do not probe the rejected old grant, start
+            // a duplicate login, or let an unrelated error kill its callback.
+            if bridge.rpc.oauth.has_flows() {
+                let authorization = bridge.rpc.oauth.diagnostics();
+                let mut value = if name == "codex_app_status" {
+                    confirmations::text_result(
+                        json!({"version":VERSION,"authorization":authorization,"mcp":{"state":"authorization_in_progress","discoveryPerformed":false}}),
+                    )
+                } else {
+                    error_result(
+                        "OAuth login is still pending or expired; this action was not executed. Complete the existing official page, or explicitly end this caller's session before starting another login.",
+                    )
+                };
+                value["structuredContent"] =
+                    json!({"authorization":authorization,"actionExecuted":false});
+                bridge.activity.lock().unwrap().last_finished = tokio::time::Instant::now();
+                op.complete(value);
+                bridge.operations.set_active(None);
+                drop(permit);
+                return;
+            }
             let result = tokio::select! {
                 value=bridge.execute(&name,&args)=>value.unwrap_or_else(|error|error_result(error.display())),
                 _=op.cancelled.cancelled()=>{
@@ -170,7 +193,7 @@ impl AppServerSession {
                 },
                 _=bridge.shutdown.cancelled()=>error_result("Adapter is shutting down; operation was not retried"),
             };
-            if result["isError"] == true {
+            if result["isError"] == true && !bridge.rpc.oauth.has_flows() {
                 // A timed-out RPC may still be executing upstream. End only this
                 // caller's runtime rather than reusing uncertain UI state.
                 let _ = bridge.cleanup_runtime().await;

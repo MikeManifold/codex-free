@@ -22,6 +22,26 @@ pub(crate) struct AppServerBridge {
 }
 
 pub(crate) struct AppServerGuard(Arc<AppServerBridge>);
+impl AppServerGuard {
+    /// Await owned children before the host runtime exits. Drop alone cannot
+    /// keep an in-flight official credential save alive during process shutdown.
+    pub(crate) async fn drain(&self) {
+        self.0.shutdown.cancel();
+        let sessions = self
+            .0
+            .sessions
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, s)| s)
+            .collect::<Vec<_>>();
+        let mut tasks = tokio::task::JoinSet::new();
+        for session in sessions {
+            tasks.spawn(async move { session.close().await });
+        }
+        while tasks.join_next().await.is_some() {}
+    }
+}
 impl Drop for AppServerGuard {
     fn drop(&mut self) {
         self.0.shutdown();
@@ -148,9 +168,13 @@ impl AppServerBridge {
                 .iter()
                 .filter_map(|(owner, s)| {
                     let a = s.activity.lock().unwrap();
+                    let (oauth_pending, oauth_finished) = s.rpc.oauth.idle_state(now);
+                    let last_finished =
+                        oauth_finished.map_or(a.last_finished, |at| at.max(a.last_finished));
                     (a.calls == 0
                         && !s.operations.has_pending()
-                        && now.saturating_duration_since(a.last_finished) >= timeout)
+                        && !oauth_pending
+                        && now.saturating_duration_since(last_finished) >= timeout)
                         .then(|| owner.clone())
                 })
                 .collect::<Vec<_>>();
