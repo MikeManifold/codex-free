@@ -63,7 +63,19 @@ def service_pid(service):
 
 def restart_registered(service):
     # The plist is unchanged. Keep its registration; do not bootout/bootstrap.
-    result = run("/bin/launchctl", "kickstart", "-k", service)
+    previous = service_pid(service)
+    if previous is not None:
+        result = run("/bin/launchctl", "kill", "SIGTERM", service)
+        if result.returncode and service_pid(service) == previous:
+            raise command_error("launchctl graceful stop", result)
+        deadline = time.monotonic() + 160
+        while service_pid(service) == previous:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Free is still draining; refusing a forced restart during possible OAuth persistence")
+            time.sleep(0.2)
+        if service_pid(service) is not None:
+            return  # KeepAlive already started the replacement.
+    result = run("/bin/launchctl", "kickstart", service)
     if result.returncode:
         raise command_error("launchctl kickstart", result)
 
@@ -175,7 +187,7 @@ def install(args):
         print("Preflight OK. Running pid: " + str(old_pid))
         print("Config: " + str(config_path))
         print("Verified release: " + expected)
-        print("Planned restart: launchctl kickstart -k (no bootout/bootstrap).")
+        print("Planned restart: graceful SIGTERM, then KeepAlive or kickstart (no forced kill).")
         return
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -207,8 +219,8 @@ def install(args):
 
     print(f"Verified new service process: {active_pid}")
     print("OK: updated binary installed; exec.mode=unrestricted; local MCP health=ok.")
-    print("Existing tunnel, project bindings, ChatGPT app permissions and R14 files were not changed.")
-    print("Return to this chat for live fallback cwd/stdin verification.")
+    print("Existing tunnel, project bindings and ChatGPT app permissions were not changed.")
+    print("Verify fallback working-directory and stdin behavior through the active connector.")
 
 
 def main():

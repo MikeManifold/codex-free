@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/install-fallback-ready.py"
@@ -47,13 +47,24 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.backup.read_bytes(), b"old-binary")
 
     def test_restart_keeps_service_registered(self):
-        with patch.object(installer, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+        with patch.object(installer, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, patch.object(installer,"service_pid",side_effect=[100,None,None]):
             installer.restart_registered(SERVICE)
-        run.assert_called_once_with("/bin/launchctl", "kickstart", "-k", SERVICE)
+        self.assertEqual(run.call_args_list,[call("/bin/launchctl","kill","SIGTERM",SERVICE),call("/bin/launchctl","kickstart",SERVICE)])
+
+    def test_keepalive_replacement_is_not_killed_again(self):
+        with patch.object(installer,"run",return_value=subprocess.CompletedProcess([],0,"","")) as run, patch.object(installer,"service_pid",side_effect=[100,200,200]):
+            installer.restart_registered(SERVICE)
+        run.assert_called_once_with("/bin/launchctl","kill","SIGTERM",SERVICE)
+
+    def test_stalled_drain_never_escalates_to_forced_restart(self):
+        with patch.object(installer,"run",return_value=subprocess.CompletedProcess([],0,"","")) as run, patch.object(installer,"service_pid",return_value=100), patch.object(installer.time,"monotonic",side_effect=[0,161]):
+            with self.assertRaisesRegex(RuntimeError,"refusing a forced restart"):
+                installer.restart_registered(SERVICE)
+        run.assert_called_once_with("/bin/launchctl","kill","SIGTERM",SERVICE)
 
     def test_restart_preserves_diagnostic(self):
         result = subprocess.CompletedProcess([], 5, "", "Input/output error")
-        with patch.object(installer, "run", return_value=result):
+        with patch.object(installer, "run", return_value=result), patch.object(installer,"service_pid",return_value=None):
             with self.assertRaisesRegex(RuntimeError, "exit 5.*Input/output error"):
                 installer.restart_registered(SERVICE)
 
