@@ -14,6 +14,8 @@ cargo run --release -- quickstart
 
 配置默认保存在 `~/.codex-free/codex.config.json`。已有安装的启动方式见[使用参考](docs/REFERENCE.md#quick-start)。
 
+另一台 Mac 整套部署：让目标机上的 Codex 使用本仓库的 [codex-free-deploy skill](.agents/skills/codex-free-deploy/SKILL.md)，按现状安装服务、持久签名和可选 UI 接入。首次安装入口是 `scripts/bootstrap-macos.py`；本机配置和凭证各自保存，不随仓库迁移。
+
 ## 工作方式
 
 ```mermaid
@@ -27,7 +29,7 @@ flowchart LR
 
 Free 是一个 Rust 服务，负责执行和转发工具调用，模型在聊天侧运行。
 
-- 本地工具：文件读写、搜索、命令执行、Git、文件传输与预览。 普通操作不自动创建 Git 快照；改动快照仅在明确调用 `show_changes` 时生成。
+- 本地工具：文件读写、搜索、命令执行、Git、文件传输与预览。普通操作不自动创建 Git 快照；改动快照仅在明确调用 `show_changes` 时生成。
 - 项目管理：多个项目共用一个服务，每个聊天选择自己的目录。默认直接使用本地目录，无需 Git 仓库或已有提交，也不因其他聊天使用该目录而自动创建副本。
 - 可选扩展：接入独立 MCP；通过官方 App Server 使用 Chrome 和原生 UI。
 

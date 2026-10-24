@@ -33,3 +33,7 @@ node_modules/
 *.p12
 *.pfx
 *.key
+*.pem
+*.local.toml
+/codex.config.json
+.DS_Store
