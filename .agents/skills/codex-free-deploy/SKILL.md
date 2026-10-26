@@ -9,15 +9,15 @@ description: "在 macOS 首次部署或迁移 Codex Free 整套服务，包含�
 
 ## 1. 先确定目标现状
 
-- 从当前仓库定位 `Cargo.toml`、`scripts/bootstrap-macos.py` 和 `scripts/install.config.example.json`。如果 skill 被单独复制，先找到配套仓库；不要把 skill 目录当源码根目录。
-- 核对 macOS、CPU 架构、Rust/Cargo、Python 3、可用端口、目标工作目录。不要要求目录有 Git 或有效 HEAD，也不要为本地操作自动建立 worktree/checkpoint。
+- 从当前仓库或下载包定位 `scripts/bootstrap-macos.py` 和 `scripts/install.config.example.json`；源码带 `Cargo.toml`，编译包带 `release.json`。如果 skill 被单独复制，先找到配套仓库或包；不要把 skill 目录当根目录。
+- 核对 macOS、CPU 架构、Python 3、可用端口、目标工作目录。只有源码构建需要 Rust/Cargo。不要要求目录有 Git 或有效 HEAD，也不要为本地操作自动建立 worktree/checkpoint。
 - 查看 `~/.codex-free/install.local.json`、运行配置、已有 LaunchAgent、安装二进制和公开签名元数据。只显示必要摘要，不能输出完整配置、环境或凭证。已有服务走第 5 步，不执行首次安装。
 - 如果需要 UI，定位目标机实际安装的官方 Codex CLI、官方 `node_repl` 和受信任 CUA 后端。CLI/App 版本和工具会变化，读取该机器现有配置与工具清单，不复制另一台机器的固定工具列表。Chrome 接入也要核对目标机实际可用后端。
 
 ## 2. 准备本机配置与身份
 
-1. 首次构建使用 `cargo build --release --locked`。首次允许下载锁定依赖；依赖齐全后更新入口可离线构建。只在目标机缺少依赖时安装，不替用户升级其他软件。
-2. 已有可用隧道/配置就复用。没有时执行 `target/release/codex-free quickstart`，按向导创建目标机的安全隧道，运行密钥只在本机安全输入。选择正确工作目录；多个项目选访问根目录。最后选择**保存但不启动**，交给 LaunchAgent 启动。不要重新申请已有上游 OAuth。
+1. 下载包先核对来源、外部 ZIP 的 `.sha256` 文件，再核对 `release.json` 的架构、提交与包内 `codex-free` 的 SHA-256，选择它作为源程序，不必安装 Rust。源码模式则执行 `cargo build --release --locked`，选择 `target/release/codex-free`。首次允许下载锁定依赖；依赖齐全后更新入口可离线构建。只在目标机缺少依赖时安装，不替用户升级其他软件。
+2. 已有可用隧道/配置就复用。没有时使用选定源程序执行 `quickstart`，按向导创建目标机的安全隧道，运行密钥只在本机安全输入。选择正确工作目录；多个项目选访问根目录。最后选择**保存但不启动**，交给 LaunchAgent 启动。不要重新申请已有上游 OAuth。
 3. 默认安装设置可直接用。需要自定义时，将 `scripts/install.config.example.json` 复制到 `~/.codex-free/install.local.json` 后修改，权限设为 600。路径和 serviceLabel 使用目标机值；signingIdentifier 一经部署保持固定，其他 App 使用不同标识。运行配置也留在 `~/.codex-free/`。
 4. 按 [本机签名](references/macos-signing.md) 复用或建立完整签名身份，确认私钥 ACL 只允许 `/usr/bin/codesign`。记录所选证书的公开 SHA-1 指纹，私钥始终留在钥匙串。
 
@@ -27,6 +27,7 @@ description: "在 macOS 首次部署或迁移 Codex Free 整套服务，包含�
 
 ```sh
 python3 scripts/bootstrap-macos.py \
+  --source /absolute/path/to/selected/codex-free \
   --work-dir /absolute/path/to/workspace \
   --certificate-sha1 PUBLIC_CERTIFICATE_SHA1
 ```
@@ -53,10 +54,10 @@ python3 scripts/bootstrap-macos.py \
 先核对本机 install 配置与签名 pin，不生成新身份：
 
 ```sh
-python3 scripts/install-stable-signed.py --source target/release/codex-free --check
-./scripts/install-local-signed.sh
+python3 scripts/install-stable-signed.py --source /absolute/path/to/new/codex-free --check
+python3 scripts/install-stable-signed.py --source /absolute/path/to/new/codex-free
 ```
 
-标准更新会构建、备份、签名，验证新文件满足旧 DR，再原子替换并检查新 PID/健康；失败恢复原文件和服务。`--migrate-from-adhoc` 只用于首次对**当前已安装程序的完全相同副本**迁移签名，不夹带功能升级。`install-fallback-ready.py --apply-unrestricted` 另含执行策略变更，不能用于默认部署。
+选定新下载包或完成源码构建后，标准更新会备份、签名，验证新文件满足旧 DR，再原子替换并检查新 PID/健康；失败恢复原文件和服务。源码目录也可用 `./scripts/install-local-signed.sh` 构建并更新。下载包的临时签名不能代替目标 Mac 的持久身份；新 Mac 不继承其他机器的 TCC 权限。`--migrate-from-adhoc` 只用于首次对**当前已安装程序的完全相同副本**迁移签名，不夹带功能升级。`install-fallback-ready.py --apply-unrestricted` 另含执行策略变更，不能用于默认部署。
 
 故障先读本机日志和实际注册状态。只重启本安装拥有的组件，给 OAuth 凭证落盘留出正常退出时间。保留备份直到健康和实际工具链验收完成，不能通过强杀、反复登录、全局放宽权限掩盖问题。

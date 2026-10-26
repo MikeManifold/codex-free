@@ -4,7 +4,15 @@
 
 ## 快速开始
 
-安装 Rust 后，在源码目录运行：
+macOS 可从 [Releases](https://github.com/MikeManifold/codex-free/releases) 下载对应的 `arm64`（Apple Silicon）或 `x86_64`（Intel）包。校验旁边的 SHA-256 文件、解压后运行：
+
+```sh
+./codex-free quickstart
+```
+
+包内含安装脚本和部署 skill，不需要安装 Rust。下载包只有临时签名、未经 Apple 公证，首次可能需要系统确认；持久安装由部署 skill 使用本机钥匙串身份签名。构建最低目标为 macOS 13.0，UI 后端另按官方组件的系统要求。
+
+从源码运行则先安装 Rust，在源码目录执行：
 
 ```sh
 cargo run --release -- quickstart
@@ -60,5 +68,7 @@ App Server 适配器在 Rust 内部，按需启动官方 CLI 子进程，处理�
 cargo test
 cargo clippy --all-targets
 ```
+
+主分支每次推送或手动运行 CI，测试通过后自动编译两种 Mac 架构并发布 `build-提交号` 预发布包；推送 `v*` 标签发布正式版本。构建失败不会发布下载包，所有构建均不使用个人签名私钥。
 
 基于 [hypnguyen1209/codex-free](https://github.com/hypnguyen1209/codex-free) 的 Rust 版本维护。采用 [MIT](LICENSE) 许可证。

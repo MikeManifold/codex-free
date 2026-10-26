@@ -1,5 +1,6 @@
 # Rust build output
 /target
+/dist/
 
 # Python test caches
 __pycache__/
