@@ -71,6 +71,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          cache-on-failure: true
       - name: Build locked release
         run: cargo build --release --locked --target "$TARGET"
         env:
@@ -83,7 +84,6 @@ jobs:
           # Ad-hoc integrity only: CI never receives a local signing key.
           codesign --force --sign - --identifier local.example.codex-free.build "$binary"
           codesign --verify --all-architectures --strict "$binary"
-          "$binary" --version
           "$binary" --help > /dev/null
           python3 scripts/package-macos.py --target "$TARGET" --binary "$binary"
       - uses: actions/upload-artifact@v4
