@@ -2,6 +2,14 @@
 
 让 ChatGPT 使用你电脑上的文件、命令、Git 和 MCP 工具。
 
+## 交给 Codex 安装
+
+直接把本仓库地址发给目标 Mac 上的 Codex，并说：
+
+> 使用仓库中的 `.agents/skills/codex-free-deploy/SKILL.md`，在这台 Mac 安装并验收 Codex Free，包括持久签名和 UI 接入，已有配置与凭证优先复用。
+
+该 skill 会自行选择并下载对应架构的程序包，不要求提前克隆仓库或安装 Rust。[Releases](https://github.com/MikeManifold/codex-free/releases) 也提供独立的 `codex-free-deploy-skill.zip`。
+
 ## 快速开始
 
 macOS 可从 [Releases](https://github.com/MikeManifold/codex-free/releases) 下载对应的 `arm64`（Apple Silicon）或 `x86_64`（Intel）包。校验旁边的 SHA-256 文件、解压后运行：

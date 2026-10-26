@@ -108,6 +108,28 @@ jobs:
           pattern: macos-*
           path: dist
           merge-multiple: true
+      - name: Package standalone deployment skill
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, zipfile
+          target = Path('dist/codex-free-deploy-skill.zip')
+          prefix = 'codex-free-macos-arm64/.agents/skills/'
+          with zipfile.ZipFile('dist/codex-free-macos-arm64.zip') as source:
+              names = sorted(n for n in source.namelist() if n.startswith(prefix + 'codex-free-deploy/'))
+              assert {n[len(prefix):] for n in names} == {
+                  'codex-free-deploy/SKILL.md',
+                  'codex-free-deploy/agents/openai.yaml',
+                  'codex-free-deploy/references/macos-signing.md',
+              }, 'Unexpected deployment skill contents'
+              with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED) as output:
+                  for name in names:
+                      info = source.getinfo(name)
+                      info.filename = name[len(prefix):]
+                      output.writestr(info, source.read(name))
+          digest = hashlib.sha256(target.read_bytes()).hexdigest()
+          target.with_suffix('.zip.sha256').write_text(digest + '  ' + target.name + '\n')
+          PY
       - name: Publish completed build
         env:
           GH_TOKEN: ${{ github.token }}
@@ -130,7 +152,8 @@ jobs:
           Source commit: $GITHUB_SHA
 
           macOS build target: 13.0. Choose arm64 for Apple Silicon or x86_64 for Intel.
-          Each ZIP includes the executable, deployment scripts and codex-free-deploy skill.
+          Platform ZIPs include the executable, deployment scripts and codex-free-deploy skill.
+          codex-free-deploy-skill.zip contains the standalone deployment skill only.
           Verify its SHA-256 sidecar before extracting. No private signing key or credentials are included.
           These builds are ad-hoc signed, without Apple notarization. Persistent installation uses your Mac's own keychain identity; OS permission confirmation may be required initially.
           EOF
