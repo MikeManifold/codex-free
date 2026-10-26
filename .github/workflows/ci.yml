@@ -136,6 +136,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$GITHUB_REF_NAME" --jq .object.sha)
+            if [[ "$head" != "$GITHUB_SHA" ]]; then
+              echo "::notice::Source branch advanced; its newer build will publish instead."
+              exit 0
+            fi
+          fi
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             tag="$GITHUB_REF_NAME"
             kind=()

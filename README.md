@@ -77,6 +77,6 @@ cargo test
 cargo clippy --all-targets
 ```
 
-主分支每次推送或手动运行 CI，测试通过后自动编译两种 Mac 架构并发布 `build-提交号` 预发布包；推送 `v*` 标签发布正式版本。构建失败不会发布下载包，所有构建均不使用个人签名私钥。
+主分支每次推送或手动运行 CI，测试通过后自动编译两种 Mac 架构并发布 `build-提交号` 预发布包；已被后续提交替代的构建跳过发布，推送 `v*` 标签发布正式版本。构建失败不会发布下载包，所有构建均不使用个人签名私钥。
 
 基于 [hypnguyen1209/codex-free](https://github.com/hypnguyen1209/codex-free) 的 Rust 版本维护。采用 [MIT](LICENSE) 许可证。
