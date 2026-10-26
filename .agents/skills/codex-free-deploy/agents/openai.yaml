@@ -1,4 +1,4 @@
 interface:
   display_name: "部署 Codex Free"
   short_description: "在新的 macOS 机器部署 Free、持久签名、App Server 与故障恢复"
-  default_prompt: "Use $codex-free-deploy to deploy this repository on this Mac, keeping credentials and signing keys local."
+  default_prompt: "Use $codex-free-deploy to download, install and verify Codex Free on this Mac, keeping credentials and signing keys local."

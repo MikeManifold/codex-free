@@ -5,14 +5,24 @@ description: "在 macOS 首次部署或迁移 Codex Free 整套服务，包含�
 
 # 部署 Codex Free
 
-把仓库中的可复用实现部署到目标 Mac。每台机器保留自己的路径、登录凭证、钥匙串私钥和系统权限；配置模板不含这些值。
+把 Codex Free 部署到目标 Mac。本 skill 可单独转发，不要求目标机预先克隆仓库。每台机器保留自己的路径、登录凭证、钥匙串私钥和系统权限；配置模板不含这些值。
 
 ## 1. 先确定目标现状
 
-- 从当前仓库或下载包定位 `scripts/bootstrap-macos.py` 和 `scripts/install.config.example.json`；源码带 `Cargo.toml`，编译包带 `release.json`。如果 skill 被单独复制，先找到配套仓库或包；不要把 skill 目录当根目录。
+- 先检查目标机是否已有可用安装，再选用现有源码或兼容下载包。若只有这份 skill，按下一节自动取得部署文件；不要把 skill 目录当程序根目录。
 - 核对 macOS、CPU 架构、Python 3、可用端口、目标工作目录。只有源码构建需要 Rust/Cargo。不要要求目录有 Git 或有效 HEAD，也不要为本地操作自动建立 worktree/checkpoint。
 - 查看 `~/.codex-free/install.local.json`、运行配置、已有 LaunchAgent、安装二进制和公开签名元数据。只显示必要摘要，不能输出完整配置、环境或凭证。已有服务走第 5 步，不执行首次安装。
 - 如果需要 UI，定位目标机实际安装的官方 Codex CLI、官方 `node_repl` 和受信任 CUA 后端。CLI/App 版本和工具会变化，读取该机器现有配置与工具清单，不复制另一台机器的固定工具列表。Chrome 接入也要核对目标机实际可用后端。
+
+## 单独收到这份 skill 时，先获取程序
+
+官方源码：[MikeManifold/codex-free](https://github.com/MikeManifold/codex-free)。官方编译包：[Releases](https://github.com/MikeManifold/codex-free/releases)。下载这些公开文件不需要 GitHub 登录或访问令牌。
+
+1. 检测物理 CPU：`sysctl -n hw.optional.arm64` 返回 `1` 时选 `arm64`，否则用 `uname -m` 确认是否为 `x86_64`；避免在 Apple Silicon 的 Rosetta 环境误选 Intel 包。先确认目标 Mac 满足该发布包的系统要求。
+2. 读取 `https://api.github.com/repos/MikeManifold/codex-free/releases?per_page=20`，选最新已发布且同时包含所需 ZIP 和 `.sha256` 的版本，允许 `build-*` 预发布。**不要只用 `/releases/latest`**：它会漏掉自动构建的预发布包。已安装版本无需更新时复用，不为了安装 skill 重装或重启 Free。
+3. 下载匹配的 `codex-free-macos-arm64.zip` 或 `codex-free-macos-x86_64.zip` 及同名 `.zip.sha256`，文件 URL 使用所选发布的官方 asset 链接。保存到本机专用的新目录，例如 `~/.local/share/codex-free/releases/<tag>/`，先核对 ZIP 的 SHA-256，再解压；不覆盖现有源码或已安装程序。
+4. 在解压目录定位 `codex-free`、`release.json`、`scripts/bootstrap-macos.py`、`scripts/install.config.example.json`。核对物理架构、元数据中的 binarySha256 与源提交，后续命令都在该程序根目录运行，继续使用本 skill 完成安装。
+5. 没有兼容包时可从上述仓库获取源码，明确改用源码构建。下载失败先查网络或具体错误，不申请无关 OAuth，不换用未知镜像；只有登录、系统安全确认和缺少必要偏好时才需要用户参与。
 
 ## 2. 准备本机配置与身份
 
@@ -23,7 +33,7 @@ description: "在 macOS 首次部署或迁移 Codex Free 整套服务，包含�
 
 ## 3. 首次安装
 
-在仓库根目录运行，替换参数中的工作目录和公开指纹：
+在选定的源码或解压包根目录运行，替换参数中的工作目录和公开指纹：
 
 ```sh
 python3 scripts/bootstrap-macos.py \
@@ -36,7 +46,7 @@ python3 scripts/bootstrap-macos.py \
 
 预检通过且部署已获用户授权后，以相同参数增加 `--apply`。入口先在副本上签名、严格验证，再安装文件和 LaunchAgent；健康检查失败会停止自己的服务并回滚。它拒绝覆盖已有安装，不创建、导出或轮换私钥，也不改变命令执行策略。一次失败先查具体原因，不能循环签名或认证。
 
-官方 UI 后端、浏览器及独立 MCP 属于可选接入：参照 [App Server 配置](../../../integrations/codex-app-server-bridge/README.md) 和现有通用模板逐项接入。凭证缺失只说明哪一项未配置，不复制原机器账户、券商权限或全部上游，也不凭猜测重新授权。
+官方 UI 后端、浏览器及独立 MCP 属于可选接入：参照程序根目录中的 `integrations/codex-app-server-bridge/README.md` 和通用模板逐项接入。凭证缺失只说明哪一项未配置，不复制原机器账户、券商权限或全部上游，也不凭猜测重新授权。
 
 ## 4. 验收并收尾
 
